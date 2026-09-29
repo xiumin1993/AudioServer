@@ -62,30 +62,43 @@ pub fn push_uplink(queue: &MicQueue, bytes: &[u8]) {
     }
 }
 
-/// 启动注入引擎线程（Windows 实现见下方 windows_impl，其他平台为空 stub）
+/// 启动注入引擎线程（Windows 见 windows_impl；macOS 见 macos_impl；其余平台 stub）
 #[cfg(windows)]
 pub fn spawn_mic_output(queue: MicQueue, event_tx: std::sync::mpsc::Sender<ServerEvent>) {
     std::thread::spawn(move || windows_impl::engine(queue, event_tx));
 }
 
-/// 非 Windows 平台 stub：直接上报"不可用"，保持上层逻辑统一
-#[cfg(not(windows))]
-pub fn spawn_mic_output(_queue: MicQueue, event_tx: std::sync::mpsc::Sender<ServerEvent>) {
-    event_tx.send(ServerEvent::MicEngine { device: None }).ok();
-    info!("[MicOut] Virtual mic injection is Windows-only (WASAPI render).");
+/// macOS：cpal 输出流渲染进 BlackHole 2ch（对端应用把输入选为 BlackHole 2ch 即用）
+#[cfg(target_os = "macos")]
+pub fn spawn_mic_output(queue: MicQueue, event_tx: std::sync::mpsc::Sender<ServerEvent>) {
+    std::thread::spawn(move || macos_impl::engine(queue, event_tx));
 }
 
-/// 启动"CABLE Output 被应用占用"检测线程（仅 Windows 有意义）。
+/// 其他平台 stub：直接上报"不可用"，保持上层逻辑统一
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn spawn_mic_output(_queue: MicQueue, event_tx: std::sync::mpsc::Sender<ServerEvent>) {
+    event_tx.send(ServerEvent::MicEngine { device: None }).ok();
+    info!("[MicOut] Virtual mic injection is implemented for Windows/macOS only.");
+}
+
+/// 启动"CABLE Output 被应用占用"检测线程。
 /// 状态翻转时通过通道回传（true = 有应用在录），服务器据此向手机推
 /// {"type":"mic_state","active":bool} —— v3.3：这条指令就是手机的
 /// 麦克风硬件开关信号：true 才开录、false 立刻停（按需录音）。
+/// Windows 实现见 windows_impl::capture_monitor（会话枚举法）。
 #[cfg(windows)]
 pub fn spawn_capture_monitor(tx: tokio::sync::mpsc::UnboundedSender<bool>) {
     std::thread::spawn(move || windows_impl::capture_monitor(tx));
 }
 
-/// 非 Windows stub：不产生任何事件
-#[cfg(not(windows))]
+/// macOS：CoreAudio"有人在录 BlackHole 注入端"检测（见 macos_impl::capture_monitor）
+#[cfg(target_os = "macos")]
+pub fn spawn_capture_monitor(tx: tokio::sync::mpsc::UnboundedSender<bool>) {
+    std::thread::spawn(move || macos_impl::capture_monitor(tx));
+}
+
+/// 其他平台 stub：不产生任何事件
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn spawn_capture_monitor(_tx: tokio::sync::mpsc::UnboundedSender<bool>) {}
 
 #[cfg(windows)]
@@ -437,5 +450,362 @@ mod windows_impl {
                 Err(_) => "Unknown".to_string(),
             }
         }
+    }
+}
+
+// ═════════════════════════ macOS 实现（v3.5 移植）═════════════════════════
+//
+// 与 Windows 版一一对应，只是把"WASAPI 渲染进 VB-CABLE"换成
+// "cpal 输出流渲染进 BlackHole 2ch"，把"会话枚举占用检测"换成
+// "CoreAudio IsRunningSomewhere 属性轮询"。
+//
+// ⚠️ 诚实声明：本模块在 Windows 上【无法编译验证】（coreaudio-sys 的绑定
+// 要在苹果环境生成），是照着 cpal 0.15.3 源码与 CoreAudio C API 写的。
+// 明天在 Mac 上首次 `cargo build` 时这里最可能报错，属预期内，逐个修即是。
+// 好消息：它被 #[cfg(target_os = "macos")] 门控，对 Windows 生产路径零影响。
+#[cfg(target_os = "macos")]
+mod macos_impl {
+    use super::*;
+    use anyhow::Result;
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use std::sync::mpsc::channel;
+
+    /// 注入目标设备名片段（BlackHole 的播放端；env PCSPEAKER_INJECT_DEVICE 可覆盖）
+    fn render_needle() -> String {
+        let w = std::env::var("PCSPEAKER_INJECT_DEVICE").unwrap_or_default();
+        if w.is_empty() {
+            "blackhole 2ch".to_string()
+        } else {
+            w.to_ascii_lowercase()
+        }
+    }
+
+    /// 引擎主循环：建流 → 报错/掉线 → 释放 → 3 秒后重试（与 windows_impl::engine 同构）
+    pub(crate) fn engine(queue: MicQueue, event_tx: std::sync::mpsc::Sender<ServerEvent>) {
+        loop {
+            match build_stream(&queue) {
+                Err(e) => {
+                    event_tx.send(ServerEvent::MicEngine { device: None }).ok();
+                    warn!("[MicOut] {}", e);
+                }
+                Ok((name, stream, err_rx)) => {
+                    if let Err(e) = stream.play() {
+                        event_tx.send(ServerEvent::MicEngine { device: None }).ok();
+                        warn!("[MicOut] cpal render play failed: {}", e);
+                        drop(stream);
+                        std::thread::sleep(std::time::Duration::from_secs(3));
+                        continue;
+                    }
+                    event_tx
+                        .send(ServerEvent::MicEngine { device: Some(name.clone()) })
+                        .ok();
+                    info!("[MicOut] Injecting into '{}' (macOS cpal render)", name);
+                    // 阻塞等 cpal 错误回调投信号（设备消失/流被系统终止）
+                    let _ = err_rx.recv();
+                    event_tx.send(ServerEvent::MicEngine { device: None }).ok();
+                    warn!("[MicOut] Render stream lost — retry in 3s");
+                    drop(stream);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+    }
+
+    /// 找 BlackHole 输出侧设备并按其真实默认格式建 cpal 渲染流。
+    /// 返回（设备名, 流, 错误信号接收端）；流由 engine 持有保活。
+    fn build_stream(
+        queue: &MicQueue,
+    ) -> Result<(String, cpal::Stream, std::sync::mpsc::Receiver<()>)> {
+        let host = cpal::default_host();
+        let needle = render_needle();
+        let device = host
+            .output_devices()?
+            .find(|d| {
+                d.name()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase()
+                    .contains(&needle)
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Virtual mic render device '{}' not found — install BlackHole first \
+                     (见 README Mac 章节)",
+                    needle
+                )
+            })?;
+        let name = device.name().unwrap_or_else(|_| "BlackHole".to_string());
+        let cfg = device.default_output_config()?;
+        let dev_rate = cfg.sample_rate().0;
+        let dev_ch: usize = cfg.channels() as usize;
+        let format = cfg.sample_format();
+        let stream_cfg = cpal::StreamConfig::from(cfg);
+        let (err_tx, err_rx) = channel::<()>();
+
+        let stream = match format {
+            // BlackHole 默认以 float32 报告 —— 主路径
+            cpal::SampleFormat::F32 => {
+                let q = queue.clone();
+                let et = err_tx.clone();
+                // 跨回调存活的重采样进位状态（与 windows_impl::pump 一致）
+                let mut carry: VecDeque<i16> = VecDeque::new();
+                let mut rpos: f64 = 0.0;
+                device.build_output_stream(
+                    &stream_cfg,
+                    move |data: &mut [f32], _| {
+                        let frames = data.len() / dev_ch.max(1);
+                        let mono = fill_frames(&q, frames, dev_rate, &mut carry, &mut rpos);
+                        for (frame, &s) in data.chunks_mut(dev_ch).zip(mono.iter()) {
+                            let v = s as f32 / 32768.0;
+                            for c in frame.iter_mut() {
+                                *c = v;
+                            }
+                        }
+                    },
+                    move |e| {
+                        warn!("[MicOut] cpal render error: {}", e);
+                        let _ = et.send(());
+                    },
+                    None,
+                )?
+            }
+            // 少数设备以 s16 报告默认格式 —— 备路径
+            cpal::SampleFormat::I16 => {
+                let q = queue.clone();
+                let et = err_tx.clone();
+                let mut carry: VecDeque<i16> = VecDeque::new();
+                let mut rpos: f64 = 0.0;
+                device.build_output_stream(
+                    &stream_cfg,
+                    move |data: &mut [i16], _| {
+                        let frames = data.len() / dev_ch.max(1);
+                        let mono = fill_frames(&q, frames, dev_rate, &mut carry, &mut rpos);
+                        for (frame, &s) in data.chunks_mut(dev_ch).zip(mono.iter()) {
+                            for c in frame.iter_mut() {
+                                *c = s;
+                            }
+                        }
+                    },
+                    move |e| {
+                        warn!("[MicOut] cpal render error: {}", e);
+                        let _ = et.send(());
+                    },
+                    None,
+                )?
+            }
+            other => anyhow::bail!("Unsupported render sample format: {:?}", other),
+        };
+        drop(err_tx); // 原件释放；回调里各持一份克隆，err_rx 仍连着
+        Ok((name, stream, err_rx))
+    }
+
+    /// 产出 frames 个单声道 i16 样本：上行速率=设备速率直取；否则线性插值重采样。
+    /// 算法与 windows_impl::pump 内联版逐行对应（v3.4.4 carry/rpos 方案）。
+    fn fill_frames(
+        queue: &MicQueue,
+        frames: usize,
+        dev_rate: u32,
+        carry: &mut VecDeque<i16>,
+        rpos: &mut f64,
+    ) -> Vec<i16> {
+        let mut mono: Vec<i16> = Vec::with_capacity(frames);
+        if frames == 0 {
+            return mono;
+        }
+        let urate = UPLINK_RATE.load(std::sync::atomic::Ordering::Relaxed);
+        let mut q = queue.lock().unwrap();
+        if urate == dev_rate || urate < 8000 {
+            for _ in 0..frames {
+                mono.push(q.pop_front().unwrap_or(0));
+            }
+            return mono;
+        }
+        let step = urate as f64 / dev_rate as f64;
+        let need = ((frames as f64 - 1.0) * step + *rpos).ceil() as usize + 1;
+        while carry.len() < need {
+            carry.push_back(q.pop_front().unwrap_or(0));
+        }
+        for i in 0..frames {
+            let p = *rpos + i as f64 * step;
+            let i0 = p as usize;
+            let f = p - i0 as f64;
+            let a = *carry.get(i0).unwrap_or(&0) as f64;
+            let b = *carry
+                .get(i0 + 1)
+                .unwrap_or_else(|| carry.get(i0).unwrap_or(&0)) as f64;
+            mono.push((a * (1.0 - f) + b * f).round() as i16);
+        }
+        let last_pos = *rpos + (frames as f64 - 1.0) * step;
+        let consumed = last_pos.floor() as usize;
+        for _ in 0..consumed.min(carry.len()) {
+            carry.pop_front();
+        }
+        *rpos = last_pos - consumed as f64;
+        while carry.len() > 4 {
+            carry.pop_front();
+        }
+        mono
+    }
+
+    /// macOS"有没有应用正在录注入设备"检测 → 驱动手机按需录音的 mic_state 信号。
+    /// 原理：CoreAudio 设备属性 kAudioDevicePropertyDeviceIsRunningSomewhere
+    /// （FourCC 'isrn'）在【输入域】非零 = 有客户端真正跑着采集 IO。
+    /// 我们的注入流在 BlackHole 2ch 的【输出侧】、下行捕获故意用 16ch 另一台设备，
+    /// 所以不会自己把自己误判成"有人在用"。
+    /// 兜底：env PCSPEAKER_MAC_MIC_ALWAYS_ACTIVE=1 → 强制视为占用中。
+    pub(crate) fn capture_monitor(tx: tokio::sync::mpsc::UnboundedSender<bool>) {
+        let forced = std::env::var("PCSPEAKER_MAC_MIC_ALWAYS_ACTIVE").is_ok();
+        let mut last = false;
+        loop {
+            let active = forced || inject_input_running().unwrap_or(false);
+            if active != last {
+                last = active;
+                info!(
+                    "[MicMon] Virtual mic capture {}",
+                    if active { "ACTIVE (an app is using the mic)" } else { "idle (nobody recording)" }
+                );
+                let _ = tx.send(active);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    }
+
+    // ── 裸 CoreAudio FFI（与 cpal 内部同一套 coreaudio-sys 绑定）──────────
+    // 属性选择器一律用 FourCC 字面量，规避"绑定里到底有没有这个常量"的不确定性
+    const K_DEVICES: u32 = 0x6465_7623; // kAudioHardwarePropertyDevices            'dev#'
+    const K_NAME_CFSTRING: u32 = 0x706E_6D72; // kAudioDevicePropertyDeviceNameCFString 'pnmr'
+    const K_IS_RUNNING_SOMEWHERE: u32 = 0x6973_726E; //                          'isrn'
+    const K_SCOPE_GLOBAL: u32 = 0x676C_6F62; // kAudioObjectPropertyScopeGlobal  'glob'
+    const K_SCOPE_INPUT: u32 = 0x696E_7074; // kAudioObjectPropertyScopeInput     'inpt'
+
+    fn prop_addr(selector: u32, scope: u32) -> coreaudio_sys::AudioObjectPropertyAddress {
+        coreaudio_sys::AudioObjectPropertyAddress {
+            mSelector: selector,
+            mScope: scope,
+            mElement: 0, // kAudioObjectPropertyElementMaster
+        }
+    }
+
+    /// 全部音频设备 ID
+    fn device_ids() -> Result<Vec<coreaudio_sys::AudioDeviceID>> {
+        unsafe {
+            let a = prop_addr(K_DEVICES, K_SCOPE_GLOBAL);
+            let mut size: u32 = 0;
+            let st = coreaudio_sys::AudioObjectGetPropertyDataSize(
+                0, // kAudioObjectSystemObject
+                &a,
+                0,
+                std::ptr::null(),
+                &mut size,
+            );
+            if st != 0 {
+                anyhow::bail!("enumerate audio devices failed: OSStatus {}", st);
+            }
+            let n = size as usize / std::mem::size_of::<coreaudio_sys::AudioDeviceID>();
+            let mut ids = vec![0 as coreaudio_sys::AudioDeviceID; n];
+            let st = coreaudio_sys::AudioObjectGetPropertyData(
+                0,
+                &a,
+                0,
+                std::ptr::null(),
+                &mut size,
+                ids.as_mut_ptr() as *mut std::ffi::c_void,
+            );
+            if st != 0 {
+                anyhow::bail!("read device list failed: OSStatus {}", st);
+            }
+            Ok(ids)
+        }
+    }
+
+    /// 设备名（CFString → Rust String；手法照 cpal macOS 后端，但补了 CFRelease）
+    fn device_name(id: coreaudio_sys::AudioDeviceID) -> Option<String> {
+        use core_foundation_sys::base::{CFRelease, CFTypeRef, kCFStringEncodingUTF8};
+        use core_foundation_sys::string::{
+            CFStringGetCString, CFStringGetCStringPtr, CFStringGetLength,
+            CFStringGetMaximumSizeForEncoding, CFStringRef,
+        };
+        unsafe {
+            let a = prop_addr(K_NAME_CFSTRING, K_SCOPE_GLOBAL);
+            let mut s: CFStringRef = std::ptr::null();
+            let mut size = std::mem::size_of::<CFStringRef>() as u32;
+            let st = coreaudio_sys::AudioObjectGetPropertyData(
+                id,
+                &a,
+                0,
+                std::ptr::null(),
+                &mut size,
+                &mut s as *mut _ as *mut std::ffi::c_void,
+            );
+            if st != 0 || s.is_null() {
+                return None;
+            }
+            let bytes: Vec<u8> = {
+                // 快路径：系统缓存的 UTF-8 指针；慢路径：自己开缓冲区拷
+                let p = CFStringGetCStringPtr(s, kCFStringEncodingUTF8);
+                if !p.is_null() {
+                    let len = (0..).take_while(|&i| *p.offset(i) != 0).count();
+                    std::slice::from_raw_parts(p as *const u8, len).to_vec()
+                } else {
+                    let n = CFStringGetLength(s);
+                    let cap = (CFStringGetMaximumSizeForEncoding(
+                        n as usize,
+                        kCFStringEncodingUTF8,
+                    ) + 1) as usize;
+                    let mut buf = vec![0u8; cap];
+                    let ok = CFStringGetCString(
+                        s,
+                        buf.as_mut_ptr() as *mut std::os::raw::c_char,
+                        cap as _,
+                        kCFStringEncodingUTF8,
+                    );
+                    if ok == 0 {
+                        CFRelease(s as CFTypeRef);
+                        return None;
+                    }
+                    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+                    buf.truncate(len);
+                    buf
+                }
+            };
+            CFRelease(s as CFTypeRef);
+            Some(String::from_utf8_lossy(&bytes).into_owned())
+        }
+    }
+
+    /// 读一个 u32 型设备属性
+    fn u32_prop(id: coreaudio_sys::AudioDeviceID, selector: u32, scope: u32) -> Option<u32> {
+        unsafe {
+            let a = prop_addr(selector, scope);
+            let mut val: u32 = 0;
+            let mut size = std::mem::size_of::<u32>() as u32;
+            let st = coreaudio_sys::AudioObjectGetPropertyData(
+                id,
+                &a,
+                0,
+                std::ptr::null(),
+                &mut size,
+                &mut val as *mut _ as *mut std::ffi::c_void,
+            );
+            if st == 0 {
+                Some(val)
+            } else {
+                None
+            }
+        }
+    }
+
+    /// 注入设备的"录音侧"此刻是否有客户端 IO 在跑
+    fn inject_input_running() -> Result<bool> {
+        let needle = render_needle();
+        for id in device_ids()? {
+            let Some(name) = device_name(id) else { continue };
+            if !name.to_ascii_lowercase().contains(&needle) {
+                continue;
+            }
+            // 找到目标设备：它输入域的运转状态就是答案
+            let running = u32_prop(id, K_IS_RUNNING_SOMEWHERE, K_SCOPE_INPUT).unwrap_or(0);
+            return Ok(running != 0);
+        }
+        anyhow::bail!("inject device '{}' not found for capture monitor", needle)
     }
 }

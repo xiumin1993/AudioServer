@@ -682,42 +682,81 @@ fn start_audio_capture(
     }
 }
 
-/// Fallback for non-Windows platforms (uses cpal input stream)
+/// 非 Windows 平台下行捕获（主战场是 macOS）：用 cpal 输入流。
+///
+/// 背景知识：macOS 没有 Windows WASAPI loopback 那种"录声卡输出"的系统能力，
+/// Mac 上的标准做法是安装免费虚拟声卡 BlackHole：
+///   1) 在"音频 MIDI 设置"里建一个【多输出设备】，同时勾选 扬声器 + BlackHole 2ch；
+///   2) 把系统声音输出指到该多输出设备 → 电脑发声的同时被"抄送"进 BlackHole；
+///   3) 本函数在 BlackHole 的【输入侧】开捕获流，录到的就是系统声音（下行音频）。
+/// 设备名可用环境变量 PCSPEAKER_CAPTURE_DEVICE 覆盖（子串匹配、大小写不敏感），
+/// 默认查找 "BlackHole 16ch" —— 故意与上行注入用的 "BlackHole 2ch" 分开两个设备：
+/// 若下行捕获和麦克风注入挤在同一个设备的两侧，占用检测（IsRunningSomewhere）
+/// 会把"服务器自己在录"也数进去 → 手机永远以为有应用在用麦。一设备一用途最干净。
 #[cfg(not(windows))]
 fn start_audio_capture(
-    config: ServerConfig,
+    _config: ServerConfig,
     client_manager: Arc<ClientManager>,
     event_tx: std::sync::mpsc::Sender<ServerEvent>,
 ) -> Result<()> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
     let host = cpal::default_host();
+
+    // ── 设备选择：在全部"输入设备"里按名字找（BlackHole 同时有输入/输出两侧）──
+    let wanted = std::env::var("PCSPEAKER_CAPTURE_DEVICE").unwrap_or_default();
+    let needle = if wanted.is_empty() {
+        "blackhole 16ch".to_string()
+    } else {
+        wanted.to_ascii_lowercase()
+    };
     let device = host
-        .default_output_device()
-        .context("No default output device found")?;
+        .input_devices()
+        .context("Failed to enumerate audio input devices")?
+        .find(|d| {
+            d.name()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .contains(&needle)
+        })
+        .with_context(|| format!(
+            "Audio capture input device containing '{}' not found. \
+             macOS 用户：请先安装 BlackHole 并把系统输出指到多输出设备（见 README Mac 章节）",
+            needle
+        ))?;
 
     let device_name = device.name().unwrap_or_else(|_| "Unknown device".to_string());
-    info!("Using audio device: {}", device_name);
-    event_tx.send(ServerEvent::Log(format!("Audio device: {}", device_name))).ok();
+    info!("Using capture device: {}", device_name);
+    event_tx
+        .send(ServerEvent::Log(format!("Audio device: {}", device_name)))
+        .ok();
 
-    let default_config = device
-        .default_output_config()
-        .context("Failed to get default output config")?;
+    // ── 格式完全跟随设备当前实际输入配置（BlackHole 常见 48kHz / 2ch / f32）──
+    let input_cfg = device
+        .default_input_config()
+        .context("Failed to get device default input format")?;
+    let sample_rate = input_cfg.sample_rate().0;
+    let channels = input_cfg.channels();
+    let sample_format = input_cfg.sample_format();
+    // From<SupportedStreamConfig>：缓冲大小等由 cpal 按设备默认值决定
+    let stream_config = cpal::StreamConfig::from(input_cfg);
 
-    let stream_config = cpal::StreamConfig {
-        channels: config.channels.into(),
-        sample_rate: cpal::SampleRate(config.sample_rate),
-        buffer_size: cpal::BufferSize::Fixed(config.buffer_size),
-    };
+    info!(
+        "Capture format (cpal): {}Hz, {}ch, {:?}",
+        sample_rate, channels, sample_format
+    );
 
-    let sample_format = default_config.sample_format();
+    // 回填真实捕获格式 → 手机会收到正确的 audio_config 头（与 Windows 路径同逻辑）
+    {
+        let mut fmt = client_manager.capture_format.blocking_lock();
+        *fmt = (sample_rate, channels);
+    }
+
     let bridge_tx = client_manager.audio_bridge_tx.clone();
-
-    let err_fn = move |err| {
-        error!("Audio stream error: {}", err);
-    };
+    let err_fn = |err| error!("[Capture] cpal stream error: {}", err);
 
     let stream = match sample_format {
+        // s16：与桥接格式一致，零转换直接转字节
         cpal::SampleFormat::I16 => device.build_input_stream(
             &stream_config,
             move |data: &[i16], _: &cpal::InputCallbackInfo| {
@@ -728,35 +767,66 @@ fn start_audio_capture(
             },
             err_fn,
             None,
-        ),
-        cpal::SampleFormat::F32 => device.build_input_stream(
-            &stream_config,
-            move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                let i16_data: Vec<i16> = data.iter()
-                    .map(|&s| (s * 32767.0) as i16)
-                    .collect();
-                let bytes = unsafe {
-                    std::slice::from_raw_parts(i16_data.as_ptr() as *const u8, i16_data.len() * 2)
-                };
-                bridge_tx.send(bytes.to_vec()).ok();
-            },
-            err_fn,
-            None,
-        ),
-        _ => {
-            anyhow::bail!("Unsupported sample format: {:?}", sample_format);
+        )?,
+        // f32：Mac 设备最常见的格式。先限幅再转 s16，防脏数据溢出爆音
+        cpal::SampleFormat::F32 => {
+            let bridge_tx = client_manager.audio_bridge_tx.clone();
+            device.build_input_stream(
+                &stream_config,
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    let i16_data: Vec<i16> = data
+                        .iter()
+                        .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
+                        .collect();
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            i16_data.as_ptr() as *const u8,
+                            i16_data.len() * 2,
+                        )
+                    };
+                    bridge_tx.send(bytes.to_vec()).ok();
+                },
+                err_fn,
+                None,
+            )?
         }
-    }?;
+        cpal::SampleFormat::F64 => {
+            let bridge_tx = client_manager.audio_bridge_tx.clone();
+            device.build_input_stream(
+                &stream_config,
+                move |data: &[f64], _: &cpal::InputCallbackInfo| {
+                    let i16_data: Vec<i16> = data
+                        .iter()
+                        .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
+                        .collect();
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            i16_data.as_ptr() as *const u8,
+                            i16_data.len() * 2,
+                        )
+                    };
+                    bridge_tx.send(bytes.to_vec()).ok();
+                },
+                err_fn,
+                None,
+            )?
+        }
+        other => anyhow::bail!("Unsupported capture sample format: {:?}", other),
+    };
 
     stream.play()?;
-    info!("Audio capture started: {}Hz, {}ch, buffer: {} samples",
-          config.sample_rate, config.channels, config.buffer_size);
-    event_tx.send(ServerEvent::Log(format!(
-        "Capture started: {}Hz, {}ch",
-        config.sample_rate, config.channels
-    ))).ok();
+    info!(
+        "Audio capture started (cpal): {}Hz, {}ch",
+        sample_rate, channels
+    );
+    event_tx
+        .send(ServerEvent::Log(format!(
+            "Capture started: {}Hz, {}ch",
+            sample_rate, channels
+        )))
+        .ok();
 
-    // Block this thread — the cpal stream and bridge forwarder handle everything
+    // 阻塞保活：`stream` 必须一直活在作用域里（drop 即停止捕获）
     loop {
         std::thread::sleep(std::time::Duration::from_secs(3600));
     }

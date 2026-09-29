@@ -772,6 +772,15 @@ async fn handle_connection(
     let addr = stream.peer_addr().unwrap_or_else(|_| "unknown".parse().unwrap());
     info!("New TCP connection from: {}", addr);
 
+    // ── 性能优化（实时性）：关闭 Nagle 算法 ──────────────────────
+    // Nagle 会把"小包等下一个小包攒一起发"，和接收端的延迟 ACK
+    // 撞上时会给每一帧音频/视频凭空加上最多 ~40ms 的抖动。
+    // 我们是实时流，宁可多发几个小包也不能等，所以每个连接一建立
+    // 就设置 TCP_NODELAY（对上下行都生效，握手完成后 ws 沿用同一 socket）。
+    if let Err(e) = stream.set_nodelay(true) {
+        info!("Failed to set TCP_NODELAY: {}", e);
+    }
+
     let ws_stream = match tokio_tungstenite::accept_async(stream).await {
         Ok(ws) => ws,
         Err(e) => {

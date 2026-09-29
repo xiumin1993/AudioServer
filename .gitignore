@@ -19,3 +19,9 @@ ui-design*.html
 
 # 调试文件
 *.pdb
+
+# 运行/构建日志
+*.log
+
+# 第三方源码压缩包（解压目录 third_party/UnityCapture-master 已提交）
+third_party/*.zip

@@ -92,6 +92,34 @@ enum AppTab {
     Log,
 }
 
+// ── v3：全局工作模式 ──
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum AppMode {
+    /// v2 原有：PC loopback 采集 → 推流到手机播放
+    Speaker,
+    /// v3 新增：手机上行 PCM → 注入 CABLE Input（系统侧 CABLE Output 即手机麦克风）
+    Mic,
+    /// v3.4 新增：手机上行 JPEG → 注入 Unity Video Capture 虚拟摄像头
+    Camera,
+}
+
+/// Mic 链路统计快照（来自 ServerEvent::MicStats）
+#[derive(Clone, Copy)]
+struct MicStatsView {
+    kbps: u32,
+    total_kb: u64,
+    interval_ms: u32,
+}
+
+/// v3.4：摄像头链路统计快照（来自 ServerEvent::CamStats）
+#[derive(Clone, Copy)]
+struct CamStatsView {
+    kbps: u32,
+    fps: u32,
+    width: u16,
+    height: u16,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[allow(dead_code)]
 enum ConnectionType {
@@ -116,6 +144,37 @@ struct AudioServerApp {
     device_name: String,
     active_tab: AppTab,
     start_time: Option<Instant>,
+    // ── v3 麦克风模式状态 ──
+    mode: AppMode,
+    /// 注入引擎已打开的播放设备名（None = 未找到 CABLE Input）
+    mic_engine_device: Option<String>,
+    /// 手机是否正在上行（v3.1 语义 = CABLE Output 被应用占用）
+    mic_live: bool,
+    /// v3.1：手机待命会话已登记（mic_start standby），等待 PC 应用取用
+    mic_session: bool,
+    /// v3.1：手机侧手动闭麦中（静音键按下）
+    mic_muted: bool,
+    /// 上行来源：IP / 采样率 / 声道
+    mic_source: Option<(String, u32, u16)>,
+    /// 电平滚动条（左旧右新，0.0~1.0）
+    mic_bars: [f32; 34],
+    /// 最近一次链路统计
+    mic_stats: Option<MicStatsView>,
+    /// 可选：mic 上行时暂停下行播放（默认关，全双工同时进行）
+    pause_speaker_live: bool,
+    // ── v3.4 摄像头模式状态 ──
+    /// 有应用正在观看 Unity Video Capture（vcam 引擎上报 = cam_state 推送依据）
+    cam_live: bool,
+    /// 手机摄像头会话已登记（cam_start），等待应用取用
+    cam_session: bool,
+    /// 上行来源手机 IP
+    cam_source: Option<String>,
+    /// 最近一次链路统计（kbps / fps / 当前分辨率）
+    cam_stats: Option<CamStatsView>,
+    /// 手机上报的能力 JSON 原文（"这台手机最高支持什么画质"）
+    cam_caps: Option<String>,
+    /// GUI 预览纹理（每秒随 CamFrame 事件刷新一张最新 JPEG 解码结果）
+    cam_texture: Option<egui::TextureHandle>,
 }
 
 impl AudioServerApp {
@@ -135,13 +194,28 @@ impl AudioServerApp {
             device_name: String::new(),
             active_tab: AppTab::Connection,
             start_time: None,
+            mode: AppMode::Speaker,
+            mic_engine_device: None,
+            mic_live: false,
+            mic_session: false,
+            mic_muted: false,
+            mic_source: None,
+            mic_bars: [0.0; 34],
+            mic_stats: None,
+            pause_speaker_live: false,
+            cam_live: false,
+            cam_session: false,
+            cam_source: None,
+            cam_stats: None,
+            cam_caps: None,
+            cam_texture: None,
         };
         // 启动时自动开启服务，不用手动点 Toggle
         app.start_server();
         app
     }
 
-    fn poll_server_events(&mut self) {
+    fn poll_server_events(&mut self, ctx: &egui::Context) {
         let mut events = Vec::new();
         if let Some(rx) = &self.event_rx {
             for _ in 0..50 {
@@ -160,11 +234,11 @@ impl AudioServerApp {
             }
         }
         for event in events {
-            self.handle_event(event);
+            self.handle_event(event, ctx);
         }
     }
 
-    fn handle_event(&mut self, event: ServerEvent) {
+    fn handle_event(&mut self, event: ServerEvent, ctx: &egui::Context) {
         match event {
             ServerEvent::Log(msg) => self.add_log(msg),
             ServerEvent::StatusChanged(status) => {
@@ -182,7 +256,106 @@ impl AudioServerApp {
             ServerEvent::Error(msg) => {
                 self.add_log(format!("[Error] {}", msg));
             }
+            // ── v3 麦克风事件 ──
+            ServerEvent::MicLevel(level) => {
+                // 滚动电平：左移一格，右侧写入新值（×3 感知增益后截断）
+                self.mic_bars.rotate_left(1);
+                self.mic_bars[self.mic_bars.len() - 1] = (level * 3.0).min(1.0);
+            }
+            ServerEvent::MicStats { kbps, total_kb, interval_ms, .. } => {
+                self.mic_stats = Some(MicStatsView { kbps, total_kb, interval_ms });
+            }
+            ServerEvent::MicSource { ip, sample_rate, channels } => {
+                self.mic_session = true;
+                self.mic_source = Some((ip, sample_rate, channels));
+            }
+            ServerEvent::MicStopped => {
+                self.mic_live = false;
+                self.mic_session = false;
+                self.mic_muted = false;
+                self.mic_source = None;
+                self.mic_stats = None;
+                self.mic_bars = [0.0; 34];
+            }
+            // v3.1：CABLE Output 被应用占用翻转 → 决定手机上行/待命
+            ServerEvent::MicState { active } => {
+                self.mic_live = active;
+                if !active {
+                    self.mic_bars = [0.0; 34];
+                }
+                self.add_log(format!(
+                    "[Mic] Capture {} (phone {})",
+                    if active { "ACTIVE" } else { "idle" },
+                    if active { "woken" } else { "standby" }
+                ));
+            }
+            // v3.1：手机静音键状态
+            ServerEvent::MicMuted { muted } => {
+                self.mic_muted = muted;
+                if muted {
+                    self.mic_bars = [0.0; 34];
+                }
+            }
+            ServerEvent::MicEngine { device } => {
+                self.mic_engine_device = device.clone();
+                match device {
+                    Some(name) => self.add_log(format!("[Mic] Engine ready → {}", name)),
+                    None => self.add_log("[Mic] Engine unavailable (CABLE Input not found)".to_string()),
+                }
+            }
+            // ── v3.4 摄像头事件 ──
+            ServerEvent::CamSource { ip } => {
+                self.cam_session = true;
+                self.cam_source = Some(ip.clone());
+                self.add_log(format!("[Cam] Phone {} ready as camera source", ip));
+            }
+            ServerEvent::CamStopped => {
+                self.cam_live = false;
+                self.cam_session = false;
+                self.cam_source = None;
+                self.cam_stats = None;
+                self.cam_texture = None;
+                self.add_log("[Cam] Camera uplink stopped".to_string());
+            }
+            ServerEvent::CamState { active } => {
+                self.cam_live = active;
+                if !active {
+                    // 无人观看：手机会立刻关相机，预览同步清掉（黑位占位）
+                    self.cam_texture = None;
+                    self.cam_stats = None;
+                }
+                self.add_log(format!(
+                    "[Cam] Virtual camera {}",
+                    if active { "is being watched by an app" } else { "released" }
+                ));
+            }
+            ServerEvent::CamStats { kbps, fps, width, height, .. } => {
+                self.cam_stats = Some(CamStatsView { kbps, fps, width, height });
+            }
+            ServerEvent::CamCaps { caps, ip } => {
+                self.cam_caps = Some(caps);
+                self.add_log(format!("[Cam] Capabilities reported by {}", ip));
+            }
+            ServerEvent::CamFrame(jpeg) => {
+                // 解码最新一帧 → 上传为 GUI 纹理（1fps，开销可忽略）
+                if let Some(tex) = decode_jpeg_to_texture(ctx, &jpeg) {
+                    self.cam_texture = Some(tex);
+                }
+            }
         }
+    }
+
+    /// 向服务器线程发命令（服务器未运行时忽略）
+    fn send_cmd(&self, cmd: ServerCommand) {
+        if let Some(tx) = &self.cmd_tx {
+            tx.send(cmd).ok();
+        }
+    }
+
+    /// 按当前模式向服务器同步"下行暂停"状态
+    fn sync_speaker_pause(&self) {
+        let pause = self.mode == AppMode::Mic && self.pause_speaker_live;
+        self.send_cmd(ServerCommand::SetSpeakerPaused(pause));
     }
 
     fn add_log(&mut self, msg: String) {
@@ -274,12 +447,31 @@ impl AudioServerApp {
 
             ui.add_space(10.0);
 
-            // 状态文字
+            // 状态文字（v3：随模式变化）
             ui.vertical(|ui| {
-                let title = if is_running {
-                    "Server Running"
-                } else {
+                let title = if !is_running {
                     "Server Stopped"
+                } else if self.mode == AppMode::Mic {
+                    if self.mic_live && self.mic_muted {
+                        "Mic Muted"
+                    } else if self.mic_live {
+                        "Mic Live"
+                    } else if self.mic_session {
+                        "Mic Standby"
+                    } else {
+                        "Mic Idle"
+                    }
+                } else if self.mode == AppMode::Camera {
+                    // v3.4：摄像头模式标题（LIVE = 有应用真的在看，手机相机已开）
+                    if self.cam_live {
+                        "Cam Live"
+                    } else if self.cam_session {
+                        "Cam Standby"
+                    } else {
+                        "Cam Idle"
+                    }
+                } else {
+                    "Server Running"
                 };
                 ui.label(
                     egui::RichText::new(title)
@@ -287,10 +479,26 @@ impl AudioServerApp {
                         .strong()
                         .color(colors::TEXT_PRIMARY),
                 );
-                let subtitle = if is_running {
-                    format!("Uptime {}", self.uptime_str())
-                } else {
+                let subtitle = if !is_running {
                     "Toggle to start".to_string()
+                } else if self.mode == AppMode::Mic {
+                    if self.mic_live {
+                        format!("Phone → CABLE · Uptime {}", self.uptime_str())
+                    } else if self.mic_session {
+                        "Phone on standby · speaks when any app opens the mic".to_string()
+                    } else {
+                        "Waiting for phone connection".to_string()
+                    }
+                } else if self.mode == AppMode::Camera {
+                    if self.cam_live {
+                        format!("Phone → Unity Video Capture · Uptime {}", self.uptime_str())
+                    } else if self.cam_session {
+                        "Phone on standby · opens camera when any app watches it".to_string()
+                    } else {
+                        "Waiting for phone camera session".to_string()
+                    }
+                } else {
+                    format!("Uptime {}", self.uptime_str())
                 };
                 ui.label(
                     egui::RichText::new(subtitle)
@@ -352,6 +560,111 @@ impl AudioServerApp {
                 }
             });
         });
+    }
+
+    // ── v3：模式切换条（Speaker / Microphone 两个胶囊按钮） ──
+    fn show_mode_switch(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.set_height(34.0);
+            let modes = [
+                (AppMode::Speaker, "Speaker Mode"),
+                (AppMode::Mic, "Microphone Mode"),
+                (AppMode::Camera, "Camera Mode"),
+            ];
+            let gap = 4.0_f32;
+            let btn_w = (ui.available_width() - gap * (modes.len() as f32 - 1.0))
+                / modes.len() as f32;
+
+            for (m, label) in &modes {
+                let is_active = self.mode == *m;
+                let (rect, resp) = ui.allocate_exact_size(
+                    egui::vec2(btn_w, 30.0),
+                    egui::Sense::click(),
+                );
+                if resp.clicked() && !is_active {
+                    self.mode = *m;
+                    // 切模式时同步下行暂停策略（默认全双工不暂停）
+                    self.sync_speaker_pause();
+                }
+                if ui.is_rect_visible(rect) {
+                    let (bg, border, text_color) = if is_active {
+                        (colors::ACCENT_BG, colors::ACCENT, colors::ACCENT)
+                    } else {
+                        (colors::BG_LIGHT, colors::BORDER, colors::TEXT_MUTED)
+                    };
+                    ui.painter().rect(
+                        rect,
+                        egui::Rounding::same(6.0),
+                        bg,
+                        egui::Stroke::new(1.0_f32, border),
+                    );
+                    let galley = ui.fonts(|f| {
+                        f.layout_no_wrap(
+                            label.to_string(),
+                            egui::FontId::proportional(if is_active { 12.5 } else { 12.0 }),
+                            text_color,
+                        )
+                    });
+                    let text_pos = egui::pos2(
+                        rect.center().x - galley.size().x / 2.0,
+                        rect.center().y - galley.size().y / 2.0,
+                    );
+                    ui.painter().galley(text_pos, galley, text_color);
+                }
+                if resp.hovered() {
+                    ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+                }
+            }
+        });
+    }
+
+    // ── v3：上行电平滚动条（复刻原型里的动画电平条） ──
+    fn show_level_bars(&self, ui: &mut egui::Ui) {
+        let bar_w = 7.0_f32;
+        let gap = 3.0_f32;
+        let max_h = 44.0_f32;
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), max_h),
+            egui::Sense::hover(),
+        );
+        if !ui.is_rect_visible(rect) {
+            return;
+        }
+        // 按可用宽度决定画多少根（从右往左取最新的值）
+        let n = ((rect.width() + gap) / (bar_w + gap)).floor() as usize;
+        let n = n.min(self.mic_bars.len());
+        let bars = &self.mic_bars[self.mic_bars.len() - n..];
+        for (i, &v) in bars.iter().enumerate() {
+            let x = rect.left() + i as f32 * (bar_w + gap);
+            let h = (v * (max_h - 4.0)).max(3.0);
+            let r = egui::Rect::from_min_size(
+                egui::pos2(x, rect.bottom() - h),
+                egui::vec2(bar_w, h),
+            );
+            let color = if v < 0.02 {
+                colors::ACCENT_BORDER
+            } else {
+                colors::ACCENT
+            };
+            ui.painter().rect_filled(r, egui::Rounding::same(3.0), color);
+        }
+    }
+
+    // ── v3：小圆角状态徽章（手绘：0.29 的 Label 无 fill） ──
+    fn show_chip(ui: &mut egui::Ui, text: &str, fg: egui::Color32, bg: egui::Color32) {
+        let galley = ui.fonts(|f| {
+            f.layout_no_wrap(text.to_string(), egui::FontId::proportional(10.0), fg)
+        });
+        let pad_x = 8.0_f32;
+        let pad_y = 3.0_f32;
+        let size = egui::vec2(galley.size().x + pad_x * 2.0, galley.size().y + pad_y * 2.0);
+        let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+        if ui.is_rect_visible(rect) {
+            ui.painter()
+                .rect_filled(rect, egui::Rounding::same(size.y / 2.0), bg);
+            let pos = rect.left_center() + egui::vec2(pad_x, 0.0);
+            ui.painter().galley(pos, galley, fg);
+        }
     }
 
     // ── Tab 栏 ──
@@ -420,10 +733,24 @@ impl AudioServerApp {
                     .color(colors::TEXT_DISABLED),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let summary = if is_running {
-                    self.audio_summary()
-                } else {
+                // v3：摘要随模式变化
+                let summary = if !is_running {
                     "Idle".to_string()
+                } else if self.mode == AppMode::Mic {
+                    match &self.mic_source {
+                        Some((_, sr, ch)) => format!("{}Hz · {}ch · MIC", sr, ch),
+                        None => "48kHz · 1ch · MIC (idle)".to_string(),
+                    }
+                } else if self.mode == AppMode::Camera {
+                    // v3.4：底部摘要显示当前上行画质（有统计时）
+                    match &self.cam_stats {
+                        Some(s) if s.width > 0 => {
+                            format!("{}×{} · {}fps · CAM", s.width, s.height, s.fps)
+                        }
+                        _ => "CAM (idle)".to_string(),
+                    }
+                } else {
+                    self.audio_summary()
                 };
                 ui.label(
                     egui::RichText::new(summary)
@@ -451,6 +778,16 @@ impl AudioServerApp {
 
     // ── Connection Tab ──
     fn show_connection_tab(&mut self, ui: &mut egui::Ui) {
+        // v3：Mic 模式呈现注入状态视图
+        if self.mode == AppMode::Mic {
+            self.show_mic_connection_tab(ui);
+            return;
+        }
+        // v3.4：Camera 模式呈现虚拟摄像头视图（预览 + 统计 + 双开关）
+        if self.mode == AppMode::Camera {
+            self.show_camera_connection_tab(ui);
+            return;
+        }
         let local_ip = Self::get_local_ip();
 
         // 连接方式按钮行
@@ -637,8 +974,526 @@ impl AudioServerApp {
         });
     }
 
+    // ── v3：Mic 模式 Connection Tab ──
+    fn show_mic_connection_tab(&mut self, ui: &mut egui::Ui) {
+        let card = egui::Frame::none()
+            .fill(colors::BG_WHITE)
+            .stroke(egui::Stroke::new(1.0_f32, colors::BORDER))
+            .rounding(8.0)
+            .inner_margin(egui::Margin::same(14.0));
+
+        // 卡片 1：虚拟麦克风状态 + 实时电平
+        card.show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("VIRTUAL MICROPHONE")
+                    .size(11.0)
+                    .color(colors::TEXT_MUTED),
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Phone Mic (VB-CABLE)")
+                        .size(14.0)
+                        .strong()
+                        .color(colors::TEXT_PRIMARY),
+                );
+                ui.add_space(8.0);
+                if self.mic_engine_device.is_some() {
+                    Self::show_chip(
+                        ui,
+                        "READY",
+                        egui::Color32::from_rgb(4, 120, 87),
+                        egui::Color32::from_rgb(236, 253, 245),
+                    );
+                } else {
+                    Self::show_chip(
+                        ui,
+                        "DRIVER NEEDED",
+                        colors::WARN_TEXT,
+                        colors::WARN_BG,
+                    );
+                }
+                // v3.1：上行状态芯片（自动感知：应用占用 → LIVE，空闲 → STANDBY）
+                if self.mic_live && self.mic_muted {
+                    Self::show_chip(
+                        ui,
+                        "MUTED",
+                        egui::Color32::from_rgb(120, 113, 108),
+                        egui::Color32::from_rgb(245, 245, 244),
+                    );
+                } else if self.mic_live {
+                    Self::show_chip(
+                        ui,
+                        "LIVE",
+                        egui::Color32::from_rgb(190, 18, 60),
+                        egui::Color32::from_rgb(255, 228, 230),
+                    );
+                } else if self.mic_session {
+                    Self::show_chip(
+                        ui,
+                        "STANDBY",
+                        egui::Color32::from_rgb(4, 120, 87),
+                        egui::Color32::from_rgb(236, 253, 245),
+                    );
+                }
+            });
+            ui.add_space(4.0);
+            self.show_level_bars(ui);
+            ui.add_space(4.0);
+            let hint = if self.mic_engine_device.is_some() {
+                "PC apps: select \"CABLE Output\" as input device — phone mic is live automatically."
+            } else {
+                "VB-CABLE playback device not found. Install VB-Audio Virtual Cable, then restart."
+            };
+            ui.label(
+                egui::RichText::new(hint)
+                    .size(11.0)
+                    .color(colors::TEXT_MUTED),
+            );
+            ui.add_space(6.0);
+            // 下行暂停开关按钮（默认全双工同时进行）
+            let btn_label = if self.pause_speaker_live {
+                "Speaker: Paused in Mic Mode"
+            } else {
+                "Speaker: Live (full duplex)"
+            };
+            if ui
+                .add(
+                    egui::Button::new(
+                        egui::RichText::new(btn_label).size(11.0).color(colors::ACCENT),
+                    )
+                    .fill(colors::ACCENT_BG)
+                    .stroke(egui::Stroke::new(1.0_f32, colors::ACCENT_BORDER))
+                    .rounding(6.0),
+                )
+                .clicked()
+            {
+                self.pause_speaker_live = !self.pause_speaker_live;
+                self.sync_speaker_pause();
+            }
+        });
+
+        ui.add_space(8.0);
+
+        // 卡片 2：上行来源（手机）
+        let card2 = egui::Frame::none()
+            .fill(colors::BG_WHITE)
+            .stroke(egui::Stroke::new(1.0_f32, colors::BORDER))
+            .rounding(8.0)
+            .inner_margin(egui::Margin::same(14.0));
+        card2.show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("MIC SOURCE (PHONE)")
+                    .size(11.0)
+                    .color(colors::TEXT_MUTED),
+            );
+            ui.add_space(6.0);
+            match &self.mic_source {
+                Some((ip, sr, ch)) => {
+                    let (ip, sr, ch) = (ip.clone(), *sr, *ch);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("\u{1F4F1}").size(16.0));
+                        ui.add_space(4.0);
+                        ui.vertical(|ui| {
+                            ui.label(
+                                egui::RichText::new(&ip)
+                                    .size(13.0)
+                                    .strong()
+                                    .color(colors::TEXT_PRIMARY),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!("{}Hz · {}ch · PCM 16-bit", sr, ch))
+                                    .size(11.0)
+                                    .monospace()
+                                    .color(colors::TEXT_MUTED),
+                            );
+                        });
+                        // 录制红点
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(10.0, 10.0),
+                                    egui::Sense::hover(),
+                                );
+                                if ui.is_rect_visible(rect) {
+                                    let pulse =
+                                        (0.6 + 0.4 * (self.uptime_f64() * 4.0).sin()) as f32;
+                                    ui.painter().circle_filled(
+                                        rect.center(),
+                                        5.0,
+                                        egui::Color32::from_rgb(220, 38, 38)
+                                            .linear_multiply(pulse),
+                                    );
+                                }
+                            },
+                        );
+                    });
+                }
+                None => {
+                    ui.label(
+                        egui::RichText::new("Waiting for phone to start mic uplink…")
+                            .size(12.0)
+                            .color(colors::TEXT_DISABLED),
+                    );
+                }
+            }
+
+            // 链路统计
+            if let Some(stats) = self.mic_stats {
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let cell = |ui: &mut egui::Ui, value: String, label: &str| {
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                egui::RichText::new(value)
+                                    .size(15.0)
+                                    .strong()
+                                    .monospace()
+                                    .color(colors::TEXT_PRIMARY),
+                            );
+                            ui.label(
+                                egui::RichText::new(label)
+                                    .size(10.0)
+                                    .color(colors::TEXT_MUTED),
+                            );
+                        });
+                    };
+                    cell(ui, format!("{}ms", stats.interval_ms), "chunk");
+                    ui.add_space(8.0);
+                    cell(ui, format!("{}k", stats.kbps), "kbps uplink");
+                    ui.add_space(8.0);
+                    cell(ui, format!("{}KB", stats.total_kb), "received");
+                });
+            }
+        });
+
+        ui.add_space(8.0);
+
+        // 卡片 3：注入引擎设备信息（对应原型 Connection Info 位置）
+        let card3 = egui::Frame::none()
+            .fill(colors::BG_WHITE)
+            .stroke(egui::Stroke::new(1.0_f32, colors::BORDER))
+            .rounding(8.0)
+            .inner_margin(egui::Margin::same(14.0));
+        card3.show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("INJECTION TARGET")
+                    .size(11.0)
+                    .color(colors::TEXT_MUTED),
+            );
+            ui.add_space(6.0);
+            let target = self
+                .mic_engine_device
+                .clone()
+                .unwrap_or_else(|| "not opened (retrying every 3s)".to_string());
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Render device")
+                        .size(13.0)
+                        .color(colors::TEXT_SECONDARY),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(target)
+                            .monospace()
+                            .size(11.0)
+                            .color(if self.mic_engine_device.is_some() {
+                                colors::ACCENT
+                            } else {
+                                colors::TEXT_DISABLED
+                            }),
+                    );
+                });
+            });
+        });
+    }
+
+    // ── v3.4：Camera 模式 Connection Tab（预览 + 统计 + 双入口控制）──
+    fn show_camera_connection_tab(&mut self, ui: &mut egui::Ui) {
+        let card = egui::Frame::none()
+            .fill(colors::BG_WHITE)
+            .stroke(egui::Stroke::new(1.0_f32, colors::BORDER))
+            .rounding(8.0)
+            .inner_margin(egui::Margin::same(14.0));
+
+        // 卡片 1：虚拟摄像头状态 + 双开关（请求 / 强制关闭）
+        card.show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("VIRTUAL CAMERA")
+                    .size(11.0)
+                    .color(colors::TEXT_MUTED),
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Unity Video Capture  ·  OBS Virtual Camera")
+                        .size(14.0)
+                        .strong()
+                        .color(colors::TEXT_PRIMARY),
+                );
+                ui.add_space(8.0);
+                // 状态芯片：LIVE=红（应用正在看，手机相机已开）/ STANDBY=绿（待命）
+                if self.cam_live {
+                    Self::show_chip(
+                        ui,
+                        "LIVE",
+                        egui::Color32::from_rgb(190, 18, 60),
+                        egui::Color32::from_rgb(255, 228, 230),
+                    );
+                } else if self.cam_session {
+                    Self::show_chip(
+                        ui,
+                        "STANDBY",
+                        egui::Color32::from_rgb(4, 120, 87),
+                        egui::Color32::from_rgb(236, 253, 245),
+                    );
+                }
+            });
+            ui.add_space(4.0);
+            let hint = if self.cam_live {
+                "An app is watching the virtual camera — the phone camera is ON right now."
+            } else if self.cam_session {
+                "Phone is on standby. Pick \"OBS Virtual Camera\" (browsers/Edge) or \"Unity Video Capture\" (desktop apps) \u{2014} the phone camera starts automatically."
+            } else {
+                "No phone camera session. Use the request button below \u{2014} the phone asks the user to approve."
+            };
+            ui.label(
+                egui::RichText::new(hint)
+                    .size(11.0)
+                    .color(colors::TEXT_MUTED),
+            );
+            ui.add_space(8.0);
+            // 双开关：请求手机开启（软） + 强制关闭（隐私硬闸）
+            ui.horizontal(|ui| {
+                let req_enabled = self.client_count > 0;
+                let req = egui::Button::new(
+                    egui::RichText::new("\u{1F4F7} Request Phone Camera")
+                        .size(11.0)
+                        .color(if req_enabled { colors::ACCENT } else { colors::TEXT_DISABLED }),
+                )
+                .fill(colors::ACCENT_BG)
+                .stroke(egui::Stroke::new(
+                    1.0_f32,
+                    if req_enabled { colors::ACCENT_BORDER } else { colors::BORDER },
+                ))
+                .rounding(6.0);
+                if ui.add_enabled(req_enabled, req).clicked() {
+                    self.send_cmd(ServerCommand::CamRequest);
+                    self.add_log("[Cam] Request sent to phone (awaiting user approval)".to_string());
+                }
+                let stop_enabled = self.cam_session;
+                let stop_btn = egui::Button::new(
+                    egui::RichText::new("\u{1F6D1} Force Stop Camera")
+                        .size(11.0)
+                        .color(if stop_enabled { colors::RED } else { colors::TEXT_DISABLED }),
+                )
+                .fill(colors::RED_BG)
+                .stroke(egui::Stroke::new(
+                    1.0_f32,
+                    if stop_enabled { colors::RED_BORDER } else { colors::BORDER },
+                ))
+                .rounding(6.0);
+                if ui.add_enabled(stop_enabled, stop_btn).clicked() {
+                    self.send_cmd(ServerCommand::CamForceStop);
+                    self.add_log("[Cam] Force stop sent — phone camera revoked".to_string());
+                }
+            });
+        });
+
+        ui.add_space(8.0);
+
+        // 卡片 2：实时预览 + 上行统计
+        let card2 = egui::Frame::none()
+            .fill(colors::BG_LIGHT)
+            .stroke(egui::Stroke::new(1.0_f32, colors::BORDER))
+            .rounding(8.0)
+            .inner_margin(egui::Margin::same(14.0));
+        card2.show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("LIVE PREVIEW (1 FPS)")
+                    .size(11.0)
+                    .color(colors::TEXT_MUTED),
+            );
+            ui.add_space(6.0);
+            let preview_w = ui.available_width();
+            match &self.cam_texture {
+                Some(tex) => {
+                    let size = tex.size(); // [w, h]（像素）
+                    let h = preview_w * size[1] as f32 / size[0].max(1) as f32;
+                    ui.add(
+                        egui::Image::from_texture(tex)
+                            .fit_to_exact_size(egui::vec2(preview_w, h))
+                            .rounding(6.0),
+                    );
+                }
+                None => {
+                    // 占位框：与预览同宽、4:3 高，文字说明为何是黑的
+                    let (_rect, _) = ui.allocate_exact_size(
+                        egui::vec2(preview_w, preview_w * 3.0 / 4.0),
+                        egui::Sense::hover(),
+                    );
+                    ui.label(
+                        egui::RichText::new("camera off — waiting for an app to watch")
+                            .size(11.0)
+                            .color(colors::TEXT_DISABLED),
+                    );
+                }
+            }
+
+            // 链路统计 cells
+            if let Some(stats) = self.cam_stats {
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let cell = |ui: &mut egui::Ui, value: String, label: &str| {
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                egui::RichText::new(value)
+                                    .size(15.0)
+                                    .strong()
+                                    .monospace()
+                                    .color(colors::TEXT_PRIMARY),
+                            );
+                            ui.label(
+                                egui::RichText::new(label)
+                                    .size(10.0)
+                                    .color(colors::TEXT_MUTED),
+                            );
+                        });
+                    };
+                    cell(
+                        ui,
+                        format!("{}×{}", stats.width, stats.height),
+                        "resolution",
+                    );
+                    ui.add_space(8.0);
+                    cell(ui, format!("{}fps", stats.fps), "uplink fps");
+                    ui.add_space(8.0);
+                    cell(ui, format!("{}k", stats.kbps), "kbps uplink");
+                });
+            }
+        });
+
+        ui.add_space(8.0);
+
+        // 卡片 3：手机来源 + 能力清单（"这台手机最高支持什么画质"）
+        let card3 = egui::Frame::none()
+            .fill(colors::BG_WHITE)
+            .stroke(egui::Stroke::new(1.0_f32, colors::BORDER))
+            .rounding(8.0)
+            .inner_margin(egui::Margin::same(14.0));
+        card3.show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("CAMERA SOURCE (PHONE)")
+                    .size(11.0)
+                    .color(colors::TEXT_MUTED),
+            );
+            ui.add_space(6.0);
+            match &self.cam_source {
+                Some(ip) => {
+                    ui.label(
+                        egui::RichText::new(format!("\u{1F4F1} {}", ip))
+                            .size(13.0)
+                            .strong()
+                            .color(colors::TEXT_PRIMARY),
+                    );
+                }
+                None => {
+                    ui.label(
+                        egui::RichText::new("Waiting for phone to register camera session…")
+                            .size(12.0)
+                            .color(colors::TEXT_DISABLED),
+                    );
+                }
+            }
+            // 能力 JSON 原文（手机上报，每镜头一档一档）—— 小字换行显示
+            if let Some(caps) = self.cam_caps.clone() {
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new("PHONE CAPABILITIES")
+                        .size(10.0)
+                        .color(colors::TEXT_MUTED),
+                );
+                ui.label(
+                    egui::RichText::new(wrap_json_brief(&caps))
+                        .size(10.0)
+                        .monospace()
+                        .color(colors::TEXT_SECONDARY),
+                );
+            }
+        });
+    }
+
+    /// v3.4：Camera 模式 Settings Tab（无参数可调，放使用说明与设备名）
+    fn show_camera_settings_tab(&self, ui: &mut egui::Ui) {
+        let card = egui::Frame::none()
+            .fill(colors::BG_WHITE)
+            .stroke(egui::Stroke::new(1.0_f32, colors::BORDER))
+            .rounding(8.0)
+            .inner_margin(egui::Margin::same(14.0));
+        card.show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("HOW TO USE")
+                    .size(11.0)
+                    .color(colors::TEXT_MUTED),
+            );
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(
+                    "1. Connect the phone app to this server.\n\
+                     2. Enable \"Camera Guardian\" on the phone, or press\n    \
+                       \"Request Phone Camera\" in Connection tab.\n\
+                     3. Pick a webcam in your app:\n    \
+                       \u{2022} Browsers / Edge / Meet \u{2192} \"OBS Virtual Camera\"\n    \
+                       \u{2022} Desktop apps (DingTalk etc.) \u{2192} \"Unity Video Capture\"\n\
+                     4. The phone camera turns ON only while watched,\n    \
+                       and turns OFF the instant the app releases it.",
+                )
+                .size(12.0)
+                .color(colors::TEXT_SECONDARY),
+            );
+            ui.add_space(10.0);
+            ui.label(
+                egui::RichText::new("Drivers: OBS Virtual Camera (browsers) + Unity Video Capture (desktop)")
+                    .size(11.0)
+                    .monospace()
+                    .color(colors::TEXT_MUTED),
+            );
+            ui.label(
+                egui::RichText::new("Placeholder: 640×480 black frame when no uplink")
+                    .size(11.0)
+                    .monospace()
+                    .color(colors::TEXT_MUTED),
+            );
+        });
+    }
+
+    /// 运行秒数（浮点，供红点脉冲动画用）
+    fn uptime_f64(&self) -> f64 {
+        match self.start_time {
+            Some(start) => start.elapsed().as_secs_f64(),
+            None => 0.0,
+        }
+    }
+
     // ── Settings Tab ──
     fn show_settings_tab(&mut self, ui: &mut egui::Ui, is_running: bool) {
+        // v3：Mic 模式呈现麦克风设置
+        if self.mode == AppMode::Mic {
+            self.show_mic_settings_tab(ui);
+            return;
+        }
+        // v3.4：Camera 模式呈现摄像头设置（设备名提示 + 待命说明）
+        if self.mode == AppMode::Camera {
+            self.show_camera_settings_tab(ui);
+            return;
+        }
         // 运行时锁定提示
         if is_running {
             let warn_frame = egui::Frame::none()
@@ -776,6 +1631,99 @@ impl AudioServerApp {
         });
     }
 
+    // ── v3：Mic 模式 Settings Tab ──
+    fn show_mic_settings_tab(&mut self, ui: &mut egui::Ui) {
+        let card = egui::Frame::none()
+            .fill(colors::BG_WHITE)
+            .stroke(egui::Stroke::new(1.0_f32, colors::BORDER))
+            .rounding(8.0)
+            .inner_margin(egui::Margin::same(14.0));
+
+        card.show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("BEHAVIOR")
+                    .size(11.0)
+                    .color(colors::TEXT_MUTED),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Pause speaker while mic live")
+                        .size(13.0)
+                        .color(colors::TEXT_SECONDARY),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let old = self.pause_speaker_live;
+                    ui.checkbox(&mut self.pause_speaker_live, "");
+                    if self.pause_speaker_live != old {
+                        self.sync_speaker_pause();
+                    }
+                });
+            });
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(
+                    "Off (default): playback and mic run at the same time (full duplex).",
+                )
+                .size(11.0)
+                .color(colors::TEXT_MUTED),
+            );
+        });
+
+        ui.add_space(8.0);
+
+        let card2 = egui::Frame::none()
+            .fill(colors::BG_WHITE)
+            .stroke(egui::Stroke::new(1.0_f32, colors::BORDER))
+            .rounding(8.0)
+            .inner_margin(egui::Margin::same(14.0));
+        card2.show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("UPLINK FORMAT (SET BY PHONE)")
+                    .size(11.0)
+                    .color(colors::TEXT_MUTED),
+            );
+            ui.add_space(8.0);
+            let (sr, ch) = match &self.mic_source {
+                Some((_, sr, ch)) => (sr.to_string(), ch.to_string()),
+                None => ("—".to_string(), "—".to_string()),
+            };
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Sample Rate")
+                        .size(13.0)
+                        .color(colors::TEXT_SECONDARY),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(sr).monospace().size(13.0).color(colors::ACCENT),
+                    );
+                });
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Channels")
+                        .size(13.0)
+                        .color(colors::TEXT_SECONDARY),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(ch).monospace().size(13.0).color(colors::ACCENT),
+                    );
+                });
+            });
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(
+                    "Keep phone at 48kHz mono to match the CABLE mix format.",
+                )
+                .size(11.0)
+                .color(colors::TEXT_MUTED),
+            );
+        });
+    }
+
     // ── Log Tab ──
     fn show_log_tab(&mut self, ui: &mut egui::Ui) {
         // 工具栏
@@ -827,6 +1775,9 @@ impl AudioServerApp {
                     for log in &self.logs {
                         let color = if log.contains("[Error]") {
                             colors::RED
+                        } else if log.contains("[Mic]") || log.contains("[Cam]") {
+                            // v3：麦克风链路日志用强调色区分（v3.4：摄像头同色）
+                            colors::ACCENT
                         } else if log.contains("started")
                             || log.contains("connected")
                             || log.contains("Device")
@@ -849,7 +1800,7 @@ impl AudioServerApp {
 
 impl eframe::App for AudioServerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_server_events();
+        self.poll_server_events(ctx);
         let is_running = self.server_status == ServerStatus::Running;
 
         // 顶部面板：Header
@@ -861,6 +1812,17 @@ impl eframe::App for AudioServerApp {
             )
             .show(ctx, |ui| {
                 self.show_header(ui, is_running);
+            });
+
+        // 顶部面板：v3 模式切换条
+        egui::TopBottomPanel::top("mode_panel")
+            .frame(
+                egui::Frame::none()
+                    .fill(colors::BG_WHITE)
+                    .inner_margin(egui::Margin::symmetric(16.0, 2.0)),
+            )
+            .show(ctx, |ui| {
+                self.show_mode_switch(ui);
             });
 
         // 顶部面板：Tab 栏
@@ -909,6 +1871,70 @@ impl eframe::App for AudioServerApp {
             self.stop_server();
         }
     }
+}
+
+/// v3.4：把手机上报的能力 JSON 排成人类可读的短行：
+///   back  ·  1280×720@30 · 960×540@30 …
+/// 本 crate 不依赖 serde_json，这里只做轻量数字扫描：
+/// 每个 "facing" 分段里、"sizes" 之后的数字恰好是 width/height/maxFps 三元组
+/// （手机侧 jsonEncode 紧凑无空格，键名不含数字，扫描是安全的）。
+fn wrap_json_brief(caps: &str) -> String {
+    let mut out = String::new();
+    for seg in caps.split(r#""facing""#).skip(1) {
+        // 镜头名：'facing': 后第一个引号里的字符串
+        let facing = seg
+            .split(':')
+            .nth(1)
+            .and_then(|s| s.trim_start().split('"').nth(1))
+            .unwrap_or("?");
+        // sizes 区段内的数字即档位
+        let body = seg.split(r#""sizes""#).nth(1).unwrap_or("");
+        let chars: Vec<char> = body.chars().collect();
+        let mut idx = 0usize;
+        let mut parts: Vec<String> = Vec::new();
+        while let Some(w) = next_number(&chars, &mut idx) {
+            let h = next_number(&chars, &mut idx).unwrap_or(0);
+            let f = next_number(&chars, &mut idx).unwrap_or(0);
+            parts.push(format!("{}×{}@{}", w, h, f));
+            if parts.len() >= 8 {
+                break;
+            }
+        }
+        if !parts.is_empty() {
+            out.push_str(&format!("{}  ·  {}\n", facing, parts.join("  ·  ")));
+        }
+    }
+    if out.is_empty() {
+        out = caps.to_string(); // 解析不了就原样显示，至少信息不丢
+    }
+    out.trim_end().to_string()
+}
+
+/// 从 *idx 起读下一个数字（跳过非数字），游标推进到该数字之后
+fn next_number(chars: &[char], idx: &mut usize) -> Option<u32> {
+    while *idx < chars.len() && !chars[*idx].is_ascii_digit() {
+        *idx += 1;
+    }
+    if *idx >= chars.len() {
+        return None;
+    }
+    let start = *idx;
+    while *idx < chars.len() && chars[*idx].is_ascii_digit() {
+        *idx += 1;
+    }
+    chars[start..*idx].iter().collect::<String>().parse().ok()
+}
+
+/// v3.4：把手机上行的一帧 JPEG 解码成 egui 纹理（GUI 预览用）。
+/// jpeg_decoder 默认输出 RGB24，与 ColorImage::from_rgb 的期望一致。
+/// 解码失败（坏帧/网络截断）返回 None，界面保留上一帧不闪烁。
+fn decode_jpeg_to_texture(ctx: &egui::Context, jpeg: &[u8]) -> Option<egui::TextureHandle> {
+    let mut decoder = jpeg_decoder::Decoder::new(jpeg);
+    let pixels = decoder.decode().ok()?;
+    let info = decoder.info()?;
+    let image =
+        egui::ColorImage::from_rgb([info.width as usize, info.height as usize], &pixels);
+    Some(ctx.load_texture("cam_frame", image, egui::TextureOptions::LINEAR))
 }
 
 fn chrono_now() -> String {

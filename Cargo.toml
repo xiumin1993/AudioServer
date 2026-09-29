@@ -21,7 +21,19 @@ windows = { version = "0.58", features = [
     "Win32_System_Threading",
     "Win32_System_Variant",
     "Win32_UI_Shell_PropertiesSystem",
+    # v3.4 摄像头：UnityCapture 共享内存发送端需要（文件映射/事件/互斥量）
+    "Win32_System_Memory",
+    "Win32_Security",
+    "Win32_System_WindowsProgramming",
+    # vcam_probe：以应用视角枚举 DirectShow 视频输入设备
+    "Win32_Media_DirectShow",
+    "Win32_System_Com_StructuredStorage",
+    # v3.4 双通道：OBS 虚拟摄像头通道用隐私监控注册表检测"有应用正在看摄像头"
+    "Win32_System_Registry",
 ] }
+
+# JPEG 解码（手机上行摄像头帧 → RGBA）
+jpeg-decoder = "0.3"
 
 # 跨平台音频捕获（备用）
 cpal = "0.15"

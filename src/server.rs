@@ -4,10 +4,17 @@ use anyhow::Context;
 use futures_util::{SinkExt, StreamExt};
 use log::{error, info, warn};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
+
+use crate::mic_out::{self, MicQueue};
+use crate::vcam::{self, FrameMailbox};
+use crate::vcam_obs;
 
 #[cfg(windows)]
 use windows::Win32::Media::Audio::{
@@ -20,7 +27,7 @@ use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_APARTMENTTHREADED, STGM_READ,
 };
 #[cfg(windows)]
-use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, PROPERTYKEY};
+use windows::Win32::UI::Shell::PropertiesSystem::PROPERTYKEY;
 #[cfg(windows)]
 use windows::core::GUID;
 
@@ -52,6 +59,64 @@ pub enum ServerEvent {
     ClientConnected(String),
     ClientDisconnected(String),
     Error(String),
+    // ── v3 麦克风上行事件 ──
+    /// 上行音频 RMS 电平（0.0 ~ 1.0），限频约 20Hz 推送
+    MicLevel(f32),
+    /// 上行链路统计，每秒推送一次
+    MicStats {
+        kbps: u32,
+        total_kb: u64,
+        packets: u64,
+        interval_ms: u32,
+    },
+    /// 手机麦克风来源已连接（收到 mic_start 头）
+    MicSource {
+        ip: String,
+        sample_rate: u32,
+        channels: u16,
+    },
+    /// 麦克风上行会话结束
+    MicStopped,
+    /// 虚拟麦克风注入引擎状态：Some(设备名) = 已向 CABLE Input 建流；None = 不可用
+    MicEngine {
+        device: Option<String>,
+    },
+    /// v3.1：CABLE Output 捕获占用状态翻转（true = 有应用正在用麦克风）
+    MicState {
+        active: bool,
+    },
+    /// v3.1：手机端手动闭麦状态（true = 用户按了静音键，服务器丢弃上行）
+    MicMuted {
+        muted: bool,
+    },
+    // ── v3.4 摄像头上行事件 ──
+    /// 手机摄像头会话已登记（收到 cam_start，手机侧相机硬件可能仍未开启）
+    CamSource {
+        ip: String,
+    },
+    /// 摄像头上行会话结束
+    CamStopped,
+    /// 应用占用虚拟摄像头状态翻转（true = 有应用在观看 Unity Video Capture）。
+    /// 同时作为 cam_state 广播给手机：手机据此开/关相机硬件（按需取景，对齐 v3.3 麦克风）
+    CamState {
+        active: bool,
+    },
+    /// 摄像头链路统计，每秒推送一次
+    CamStats {
+        kbps: u32,
+        fps: u32,
+        frames: u64,
+        width: u16,
+        height: u16,
+    },
+    /// 手机上报的相机硬件能力（JSON 原文，GUI 展示"手机最高支持什么画质"）
+    CamCaps {
+        caps: String,
+        ip: String,
+    },
+    /// v3.4 GUI 预览：每秒随 CamStats 附带一张最新 JPEG 帧（仅给界面显示，
+    /// 不进虚拟摄像头链路 —— 那条路走 cam_mailbox，互不干扰）
+    CamFrame(Vec<u8>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -63,17 +128,49 @@ pub enum ServerStatus {
 /// GUI → Server commands
 pub enum ServerCommand {
     Stop,
+    /// 暂停/恢复 loopback 音频向客户端的转发（v3：Mic 模式下避免回声与带宽挤占）
+    SetSpeakerPaused(bool),
+    /// v3.4：GUI"请求手机开启摄像头"→ 向所有手机广播 cam_request（手机弹窗确认）
+    CamRequest,
+    /// v3.4：GUI"强制关闭摄像头"→ 向所有手机广播 cam_stop（守护隐私，立即生效）
+    CamForceStop,
 }
+
+/// WebSocket 写半端类型别名：发送/接收两个任务通过 Arc<Mutex> 共享
+/// （v3 需要接收任务在收到 mic_start 后回 mic_ack，写端不能再被发送任务独占）
+type WsSink = futures_util::stream::SplitSink<WebSocketStream<TcpStream>, Message>;
 
 /// Client connection manager
 struct ClientManager {
     clients: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>>,
+    /// v3.1：每个已连接客户端的 WebSocket 文本写端（ip → sink），
+    /// 用于向手机广播 mic_state 唤醒/休眠指令
+    text_sinks: Arc<Mutex<HashMap<String, Arc<Mutex<WsSink>>>>>,
+    /// v3.1：当前是否有 PC 应用在录 CABLE Output（由捕获检测线程更新）。
+    /// true 时才接收/注入手机上行，待命期手机不上传数据（省电）
+    mic_live: Arc<AtomicBool>,
+    /// v3.1：手机侧手动闭麦标志（true = 静音键按下，上行直接丢弃 + 清队列）
+    mic_muted: Arc<AtomicBool>,
     /// Actual capture format from WASAPI (sample_rate, channels)
     capture_format: Arc<Mutex<(u32, u16)>>,
     /// Bridge: audio capture thread → tokio forwarding task
     /// 使用 tokio::sync::mpsc 替代 crossbeam_channel，
     /// 这样转发任务可以用纯异步 recv().await，不再需要 spawn_blocking
     audio_bridge_tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// v3：手机上行 PCM 队列，由 mic_out 注入线程消费写入 CABLE Input
+    mic_queue: MicQueue,
+    // ── v3.4 摄像头 ──
+    /// 最新 JPEG 帧邮箱：WS 接收任务写入，vcam 引擎线程取走解码上传驱动
+    cam_mailbox: FrameMailbox,
+    /// v3.4 双通道：OBS 虚拟摄像头引擎的独立邮箱（同一帧推两份，互不抢消费）
+    cam_mailbox_obs: FrameMailbox,
+    /// 手机已登记摄像头会话（cam_start），准备接收二进制帧
+    cam_session: Arc<AtomicBool>,
+    /// 有应用正在观看虚拟摄像头（vcam 引擎上报），驱动 cam_state 广播
+    cam_live: Arc<AtomicBool>,
+    /// 双通道各自的活跃信号：cam_live = unity || obs（任一设备被占用就唤醒手机）
+    cam_live_unity: Arc<AtomicBool>,
+    cam_live_obs: Arc<AtomicBool>,
 }
 
 impl ClientManager {
@@ -82,11 +179,68 @@ impl ClientManager {
         (
             Self {
                 clients: Arc::new(Mutex::new(HashMap::new())),
+                text_sinks: Arc::new(Mutex::new(HashMap::new())),
+                mic_live: Arc::new(AtomicBool::new(false)),
+                mic_muted: Arc::new(AtomicBool::new(false)),
                 capture_format: Arc::new(Mutex::new((48000, 2))),
                 audio_bridge_tx: tx,
+                mic_queue: mic_out::new_queue(),
+                cam_mailbox: vcam::new_mailbox(),
+                cam_mailbox_obs: vcam::new_mailbox(),
+                cam_session: Arc::new(AtomicBool::new(false)),
+                cam_live: Arc::new(AtomicBool::new(false)),
+                cam_live_unity: Arc::new(AtomicBool::new(false)),
+                cam_live_obs: Arc::new(AtomicBool::new(false)),
             },
             rx,
         )
+    }
+
+    /// v3.1：向所有已连接手机广播麦克风唤醒/休眠状态。
+    /// 唤醒瞬间清空上行抖动队列，丢弃任何残留旧数据，保证新会话从实时点开始。
+    async fn broadcast_mic_state(&self, active: bool) {
+        self.mic_live.store(active, Ordering::Relaxed);
+        if active {
+            if let Ok(mut q) = self.mic_queue.lock() {
+                q.clear();
+            }
+        }
+        let msg = format!(r#"{{"type":"mic_state","active":{}}}"#, active);
+        let sinks = self.text_sinks.lock().await;
+        for sink in sinks.values() {
+            let mut s = sink.lock().await;
+            let _ = s.send(Message::Text(msg.clone())).await;
+        }
+    }
+
+    /// v3.4：向所有已连接手机广播"虚拟摄像头是否被应用观看"。
+    /// active=true → 手机才开相机硬件上行；false → 手机立刻关相机（按需取景）。
+    /// 唤醒瞬间清空帧邮箱，保证新会话从实时点开始（不会先看到旧画面）。
+    async fn broadcast_cam_state(&self, active: bool) {
+        self.cam_live.store(active, Ordering::Relaxed);
+        if active {
+            if let Ok(mut mb) = self.cam_mailbox.lock() {
+                *mb = None;
+            }
+            if let Ok(mut mb) = self.cam_mailbox_obs.lock() {
+                *mb = None;
+            }
+        }
+        let msg = format!(r#"{{"type":"cam_state","active":{}}}"#, active);
+        let sinks = self.text_sinks.lock().await;
+        for sink in sinks.values() {
+            let mut s = sink.lock().await;
+            let _ = s.send(Message::Text(msg.clone())).await;
+        }
+    }
+
+    /// v3.4：向所有手机广播一条文本指令（cam_request / cam_stop 等 GUI 发起的操作）
+    async fn broadcast_cam_text(&self, msg: &str) {
+        let sinks = self.text_sinks.lock().await;
+        for sink in sinks.values() {
+            let mut s = sink.lock().await;
+            let _ = s.send(Message::Text(msg.to_string())).await;
+        }
     }
 
     async fn add_client(&self, client_key: String) -> mpsc::UnboundedReceiver<Vec<u8>> {
@@ -97,6 +251,7 @@ impl ClientManager {
 
     async fn remove_client(&self, client_key: &str) {
         self.clients.lock().await.remove(client_key);
+        self.text_sinks.lock().await.remove(client_key);
     }
 
     async fn _client_count(&self) -> usize {
@@ -115,6 +270,9 @@ pub async fn run_server(
     let (client_manager, mut bridge_rx) = ClientManager::new();
     let client_manager = Arc::new(client_manager);
 
+    // v3：GUI 切到 Mic 模式时置 true，转发任务跳过 loopback 数据包（直接丢弃，不堆积）
+    let speaker_paused = Arc::new(AtomicBool::new(false));
+
     // Spawn a Tokio task to forward audio from capture thread to WebSocket clients
     // 【关键修复】不再使用 spawn_blocking 逐包等待，改用纯异步 recv().await。
     // 之前每个音频包都要 spawn_blocking → 阻塞线程 → recv() → 返回 → 再 spawn_blocking，
@@ -122,9 +280,14 @@ pub async fn run_server(
     // 现在用 tokio::sync::mpsc，WASAPI 线程用 send()（同步非阻塞）写入，
     // 转发任务用 recv().await（纯异步）读取，零额外线程、零调度开销。
     let fwd_manager = client_manager.clone();
+    let fwd_paused = speaker_paused.clone();
     tokio::spawn(async move {
         let mut packet_count: u64 = 0;
         while let Some(data) = bridge_rx.recv().await {
+            // Mic 模式：暂停下行转发
+            if fwd_paused.load(Ordering::Relaxed) {
+                continue;
+            }
             packet_count += 1;
             if packet_count % 100 == 1 {
                 info!("[Bridge] Forwarded {} packets, latest {} bytes, {} clients",
@@ -160,6 +323,52 @@ pub async fn run_server(
         }
     });
 
+    // v3：启动虚拟麦克风注入引擎（把 mic_queue 里的上行 PCM 持续写入 CABLE Input）
+    mic_out::spawn_mic_output(client_manager.mic_queue.clone(), event_tx.clone());
+
+    // v3.1：启动"应用占用麦克风"检测线程。检测结果通过 std 通道进入 tokio，
+    // 再 ① 转成 GUI 事件 ② 向所有已连接手机广播 mic_state 唤醒/休眠指令
+    let (mon_tx, mut mon_rx) = mpsc::unbounded_channel::<bool>();
+    mic_out::spawn_capture_monitor(mon_tx);
+    let mon_manager = client_manager.clone();
+    let mon_event_tx = event_tx.clone();
+    tokio::spawn(async move {
+        while let Some(active) = mon_rx.recv().await {
+            mon_event_tx.send(ServerEvent::MicState { active }).ok();
+            mon_manager.broadcast_mic_state(active).await;
+        }
+    });
+
+    // v3.4：启动 Unity Capture 虚拟摄像头注入引擎（消费 cam_mailbox 里的 JPEG 帧）。
+    // 引擎线程通过 Want 事件判断"有应用在观看摄像头"，翻转时经通道回传。
+    let (cam_tx, mut cam_rx) = mpsc::unbounded_channel::<bool>();
+    vcam::spawn_vcam(client_manager.cam_mailbox.clone(), cam_tx);
+
+    // v3.4 双通道：再开一条 OBS Virtual Camera 注入线（浏览器/新框架应用只认它）。
+    // OBS 协议没有 Want 事件，用隐私监控注册表判断"有应用在访问摄像头"。
+    let (cam_obs_tx, mut cam_obs_rx) = mpsc::unbounded_channel::<bool>();
+    vcam_obs::spawn_vcam_obs(client_manager.cam_mailbox_obs.clone(), cam_obs_tx);
+
+    // 两路活跃信号在这里合并（OR 语义）：任一虚拟摄像头被观看 → 唤醒手机开相机；
+    // 两路都释放 → 手机立刻关相机回待命。翻转时 ① 推 GUI 事件 ② 广播 cam_state
+    let cam_manager = client_manager.clone();
+    let cam_event_tx = event_tx.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                Some(v) = cam_rx.recv() => { cam_manager.cam_live_unity.store(v, Ordering::Relaxed); }
+                Some(v) = cam_obs_rx.recv() => { cam_manager.cam_live_obs.store(v, Ordering::Relaxed); }
+                else => break,
+            }
+            let now = cam_manager.cam_live_unity.load(Ordering::Relaxed)
+                || cam_manager.cam_live_obs.load(Ordering::Relaxed);
+            if cam_manager.cam_live.swap(now, Ordering::Relaxed) != now {
+                cam_event_tx.send(ServerEvent::CamState { active: now }).ok();
+                cam_manager.broadcast_cam_state(now).await;
+            }
+        }
+    });
+
     // Wait for audio capture to initialize
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 
@@ -189,7 +398,12 @@ pub async fn run_server(
                         info!("New connection: {}", addr);
                         let manager = client_manager.clone();
                         let event_tx_clone = event_tx.clone();
-                        let client_key = addr.ip().to_string();
+                        // v3.4 修复：客户端 key 必须含端口、每条 TCP 连接唯一。
+                        // 之前只用 IP：手机快速重连时新旧两条连接共用同一 key，
+                        // 新连接覆盖登记表 → 旧连接断开时 remove_client 把
+                        // 【新连接的存活表项】一起删掉 → 手机在线却永远收不到
+                        // mic_state/cam_state 唤醒广播（语音输入失效的直接原因）。
+                        let client_key = format!("{}:{}", addr.ip(), addr.port());
                         tokio::spawn(async move {
                             handle_connection(stream, client_key, manager, event_tx_clone.clone()).await;
                         });
@@ -204,6 +418,24 @@ pub async fn run_server(
                     Some(ServerCommand::Stop) | None => {
                         info!("Stopping server...");
                         break;
+                    }
+                    Some(ServerCommand::SetSpeakerPaused(paused)) => {
+                        speaker_paused.store(paused, Ordering::Relaxed);
+                        info!("Speaker forwarding {}", if paused { "paused" } else { "resumed" });
+                    }
+                    // v3.4：GUI"请求手机开启摄像头"——手机弹窗确认后才开硬件
+                    Some(ServerCommand::CamRequest) => {
+                        info!("[Cam] Request sent to phones (user must confirm)");
+                        client_manager
+                            .broadcast_cam_text(r#"{"type":"cam_request"}"#)
+                            .await;
+                    }
+                    // v3.4：GUI"强制关闭摄像头"——隐私守护开关，手机收到立即停
+                    Some(ServerCommand::CamForceStop) => {
+                        info!("[Cam] Force stop sent to phones");
+                        client_manager
+                            .broadcast_cam_text(r#"{"type":"cam_stop","forced":true}"#)
+                            .await;
                     }
                 }
             }
@@ -548,8 +780,15 @@ async fn handle_connection(
         }
     };
 
-    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+    let (ws_sink, mut ws_receiver) = ws_stream.split();
+    let ws_sink: Arc<Mutex<WsSink>> = Arc::new(Mutex::new(ws_sink));
     let mut audio_rx = client_manager.add_client(client_key.clone()).await;
+    // v3.1：登记文本写端，捕获状态翻转时可向本客户端推 mic_state
+    client_manager
+        .text_sinks
+        .lock()
+        .await
+        .insert(client_key.clone(), ws_sink.clone());
 
     event_tx.send(ServerEvent::ClientConnected(client_key.clone())).ok();
     event_tx.send(ServerEvent::Log(format!("Client connected: {}", client_key))).ok();
@@ -563,27 +802,267 @@ async fn handle_connection(
         r#"{{"type":"audio_config","sample_rate":{},"channels":{},"format":"pcm_s16le"}}"#,
         actual_sr, actual_ch
     );
-    if let Err(e) = ws_sender.send(Message::Text(header)).await {
-        error!("Failed to send header: {}", e);
-        client_manager.remove_client(&client_key).await;
-        return;
+    {
+        let mut sink = ws_sink.lock().await;
+        if let Err(e) = sink.send(Message::Text(header)).await {
+            error!("Failed to send header: {}", e);
+            client_manager.remove_client(&client_key).await;
+            return;
+        }
     }
 
-    // Send audio data
+    // Downlink send task: loopback audio → WebSocket
+    // 客户端被移出广播表时 audio_rx 自然关闭，任务退出（Mic 模式即走此路径停止下行）
+    let sink_send = ws_sink.clone();
+    let key_send = client_key.clone();
     let send_task = tokio::spawn(async move {
         while let Some(data) = audio_rx.recv().await {
-            if ws_sender.send(Message::Binary(data)).await.is_err() {
+            let mut sink = sink_send.lock().await;
+            if sink.send(Message::Binary(data)).await.is_err() {
                 break;
             }
         }
+        info!("[{}] Downlink task exited", key_send);
     });
 
-    // Receive client messages
+    // Receive task: client messages + v3 mic uplink
+    let sink_recv = ws_sink.clone();
+    let mgr_recv = client_manager.clone();
+    let key_recv = client_key.clone();
+    let event_tx_recv = event_tx.clone();
+    let mic_live_recv = client_manager.mic_live.clone();
+    let mic_muted_recv = client_manager.mic_muted.clone();
+    // v3.4：摄像头会话/占用标志（跨任务共享）
+    let cam_session_recv = client_manager.cam_session.clone();
+    let cam_live_recv = client_manager.cam_live.clone();
     let recv_task = tokio::spawn(async move {
+        // Mic 会话状态（未收到 mic_start 前行为与 v2 完全相同）
+        // 全双工：mic 期间下行转发照常，不摘除订阅
+        // v3.3：手机连接即发 mic_start 进入【待命】（麦克风硬件关闭）；
+        // 本服务器检测到 PC 应用开始录 CABLE Output 时推 mic_state true，
+        // 手机才开硬件上行；PC 应用停止 → 推 false → 手机立刻停录。
+        let mut mic_session = false;
+        let mut mic_packets: u64 = 0;
+        let mut mic_bytes_window: u64 = 0;
+        let mut mic_bytes_total: u64 = 0;
+        let mut last_pkt: Option<Instant> = None;
+        let mut interval_sum: u64 = 0;
+        let mut interval_n: u64 = 0;
+        let mut window_start = Instant::now();
+
+        // v3.4：摄像头上行统计（独立窗口，每秒推一次 CamStats）
+        let mut cam_packets: u64 = 0;
+        let mut cam_bytes_window: u64 = 0;
+        let mut cam_window_start = Instant::now();
+        let mut cam_frame_dims: (u16, u16) = (0, 0);
+        // GUI 预览用：暂存窗口内最新一帧，随每秒统计一起发出（1fps 足够看画面）
+        let mut cam_preview_hold: Option<Vec<u8>> = None;
+
         while let Some(msg) = ws_receiver.next().await {
             match msg {
                 Ok(Message::Text(text)) => {
                     info!("Client message: {}", text);
+                    // 去掉空白后做轻量匹配，无需 serde
+                    let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+                    if compact.contains("\"type\":\"mic_start\"") && !mic_session {
+                        let sr = json_number(&compact, "sample_rate").unwrap_or(48000) as u32;
+                        let ch = json_number(&compact, "channels").unwrap_or(1) as u16;
+                        mic_session = true;
+                        // v3.1 修复：新会话一律重置全局静音标志。
+                        // 否则上一个客户端按过静音后标志残留 true，
+                        // 新连接（甚至新重启的客户端）上行会被全部丢弃 —— 
+                        // 这正是"手机显示在录音、电脑却完全无声"的元凶之一。
+                        mic_muted_recv.store(false, Ordering::Relaxed);
+                        // 顺带清空上一会话残留的尾音，GUI 静音角标复位
+                        if let Ok(mut q) = mgr_recv.mic_queue.lock() {
+                            q.clear();
+                        }
+                        event_tx_recv.send(ServerEvent::MicMuted { muted: false }).ok();
+                        // 回执给手机（附带当前捕获状态：若应用已在用麦克风，手机立即上行）
+                        let live_now = mic_live_recv.load(Ordering::Relaxed);
+                        let mut sink = sink_recv.lock().await;
+                        let _ = sink
+                            .send(Message::Text(format!(
+                                r#"{{"type":"mic_ack","active":{}}}"#,
+                                live_now
+                            )))
+                            .await;
+                        drop(sink);
+                        event_tx_recv
+                            .send(ServerEvent::MicSource {
+                                ip: key_recv.clone(),
+                                sample_rate: sr,
+                                channels: ch,
+                            })
+                            .ok();
+                        event_tx_recv
+                            .send(ServerEvent::Log(format!(
+                                "[Mic] Standby session: {}Hz, {}ch from {} (live={})",
+                                sr, ch, key_recv, live_now
+                            )))
+                            .ok();
+                    } else if compact.contains("\"type\":\"mic_stop\"") && mic_session {
+                        // 手机端主动结束会话（断开/手动关闭）
+                        mic_session = false;
+                        if mic_live_recv.load(Ordering::Relaxed) {
+                            event_tx_recv.send(ServerEvent::MicStopped).ok();
+                        }
+                        event_tx_recv
+                            .send(ServerEvent::Log(format!("[Mic] Uplink stopped by {}", key_recv)))
+                            .ok();
+                    } else if compact.contains("\"type\":\"mic_mute\"") {
+                        // v3.1：手机"静音键"。按下后服务器丢弃上行（等效闭麦），
+                        // 并清空抖动队列 —— 防止关麦前的尾音还在 PC 里播放
+                        // muted 是布尔字段，直接匹配序列化后的 "muted":true
+                        let muted = compact.contains("\"muted\":true");
+                        mic_muted_recv.store(muted, Ordering::Relaxed);
+                        if muted {
+                            if let Ok(mut q) = mgr_recv.mic_queue.lock() {
+                                q.clear();
+                            }
+                        }
+                        event_tx_recv.send(ServerEvent::MicMuted { muted }).ok();
+                        event_tx_recv
+                            .send(ServerEvent::Log(format!(
+                                "[Mic] {} by {}",
+                                if muted { "Muted (manual)" } else { "Unmuted" },
+                                key_recv
+                            )))
+                            .ok();
+                    // ── v3.4 摄像头指令 ──
+                    } else if compact.contains("\"type\":\"cam_capabilities\"") {
+                        // 手机上报相机硬件能力（每颗镜头的分辨率/帧率清单）。
+                        // 服务器不解析细节，原文转给 GUI 展示"手机最高支持什么画质"
+                        event_tx_recv
+                            .send(ServerEvent::CamCaps {
+                                caps: text.to_string(),
+                                ip: key_recv.clone(),
+                            })
+                            .ok();
+                        event_tx_recv
+                            .send(ServerEvent::Log(format!(
+                                "[Cam] Capabilities from {}: {}",
+                                key_recv, compact
+                            )))
+                            .ok();
+                    } else if compact.contains("\"type\":\"cam_start\"") {
+                        // 手机相机硬件已打开、开始推 JPEG 帧（或待命登记，语义同 mic_start）
+                        cam_session_recv.store(true, Ordering::Relaxed);
+                        // 回执附带当前占用状态：若应用已在观看，手机保持推流；
+                        // 若无人观看，手机可回到"硬件关闭"待命，等 cam_state 唤醒
+                        let live_now = cam_live_recv.load(Ordering::Relaxed);
+                        let mut sink = sink_recv.lock().await;
+                        let _ = sink
+                            .send(Message::Text(format!(
+                                r#"{{"type":"cam_ack","active":{}}}"#,
+                                live_now
+                            )))
+                            .await;
+                        drop(sink);
+                        event_tx_recv
+                            .send(ServerEvent::CamSource { ip: key_recv.clone() })
+                            .ok();
+                        event_tx_recv
+                            .send(ServerEvent::Log(format!(
+                                "[Cam] Session from {} (live={})",
+                                key_recv, live_now
+                            )))
+                            .ok();
+                    } else if compact.contains("\"type\":\"cam_stop\"") {
+                        // 手机端主动结束摄像头会话（或手机端确认关闭）
+                        cam_session_recv.store(false, Ordering::Relaxed);
+                        if let Ok(mut mb) = mgr_recv.cam_mailbox.lock() {
+                            *mb = None;
+                        }
+                        if let Ok(mut mb) = mgr_recv.cam_mailbox_obs.lock() {
+                            *mb = None;
+                        }
+                        event_tx_recv.send(ServerEvent::CamStopped).ok();
+                        event_tx_recv
+                            .send(ServerEvent::Log(format!("[Cam] Stopped by {}", key_recv)))
+                            .ok();
+                    }
+                }
+                Ok(Message::Binary(data)) => {
+                    // v3.4：摄像头 JPEG 帧带 4 字节魔术头 [0x03,'C','A','M']，
+                    // PCM 音频包撞头的概率约 2^-32，可安全分流两种二进制帧
+                    if data.len() > 4 && data[0] == 0x03 && &data[1..4] == b"CAM" {
+                        if cam_session_recv.load(Ordering::Relaxed) {
+                            let jpeg = data[4..].to_vec();
+                            // v3.4 双通道：同一帧分别投给两个引擎的邮箱
+                            vcam::push_frame(&mgr_recv.cam_mailbox, jpeg.clone());
+                            vcam_obs::push_frame(&mgr_recv.cam_mailbox_obs, jpeg);
+                            cam_preview_hold = Some(data[4..].to_vec());
+                            cam_packets += 1;
+                            cam_bytes_window += data.len() as u64;
+                            // 从 JPEG 头里读出这一帧的分辨率（用于 GUI 显示"当前画质"）
+                            if let Some((w, h)) = jpeg_dims(&data[4..]) {
+                                cam_frame_dims = (w, h);
+                            }
+                            // 每秒推一次摄像头链路统计（附带最新一帧给 GUI 预览）
+                            let elapsed = cam_window_start.elapsed();
+                            if elapsed.as_millis() >= 1000 {
+                                let secs = elapsed.as_millis() as f64 / 1000.0;
+                                let kbps = (cam_bytes_window as f64 * 8.0 / 1000.0 / secs) as u32;
+                                let fps = (cam_packets as f64 / secs) as u32;
+                                event_tx_recv
+                                    .send(ServerEvent::CamStats {
+                                        kbps,
+                                        fps,
+                                        frames: cam_packets,
+                                        width: cam_frame_dims.0,
+                                        height: cam_frame_dims.1,
+                                    })
+                                    .ok();
+                                if let Some(frame) = cam_preview_hold.take() {
+                                    event_tx_recv.send(ServerEvent::CamFrame(frame)).ok();
+                                }
+                                cam_packets = 0;
+                                cam_bytes_window = 0;
+                                cam_window_start = Instant::now();
+                            }
+                        }
+                    }
+                    // v3.3：会话已登记（mic_start）且未静音 → 一律接收注入。
+                    // 硬件开关由手机按 mic_state 自己执行（待命时根本不会发数据），
+                    // 服务器不做二次判断 —— 双端语义一致，链路最简单可靠。
+                    // mic_live 标志同时驱动 mic_state 广播与 GUI 显示。
+                    else if mic_session && !mic_muted_recv.load(Ordering::Relaxed) {
+                        let level = rms_level(&data);
+                        mic_out::push_uplink(&mgr_recv.mic_queue, &data);
+                        mic_packets += 1;
+                        mic_bytes_window += data.len() as u64;
+                        mic_bytes_total += data.len() as u64;
+                        if let Some(t) = last_pkt {
+                            interval_sum += t.elapsed().as_millis() as u64;
+                            interval_n += 1;
+                        }
+                        last_pkt = Some(Instant::now());
+                        // 每 5 包推一次电平（手机侧 10ms/包 ≈ 20Hz 刷新）
+                        if mic_packets % 5 == 0 {
+                            event_tx_recv.send(ServerEvent::MicLevel(level)).ok();
+                        }
+                        // 每秒推一次链路统计
+                        let elapsed = window_start.elapsed();
+                        if elapsed.as_millis() >= 1000 {
+                            let secs = elapsed.as_millis() as f64 / 1000.0;
+                            let kbps = (mic_bytes_window as f64 * 8.0 / 1000.0 / secs) as u32;
+                            let interval_ms =
+                                if interval_n > 0 { (interval_sum / interval_n) as u32 } else { 0 };
+                            event_tx_recv
+                                .send(ServerEvent::MicStats {
+                                    kbps,
+                                    total_kb: mic_bytes_total / 1024,
+                                    packets: mic_packets,
+                                    interval_ms,
+                                })
+                                .ok();
+                            mic_bytes_window = 0;
+                            interval_sum = 0;
+                            interval_n = 0;
+                            window_start = Instant::now();
+                        }
+                    }
                 }
                 Ok(Message::Close(_)) => {
                     info!("Client requested close");
@@ -596,14 +1075,91 @@ async fn handle_connection(
                 _ => {}
             }
         }
+
+        if mic_session {
+            // 会话结束（无论待命还是上行中），GUI 复位
+            event_tx_recv.send(ServerEvent::MicStopped).ok();
+            event_tx_recv
+                .send(ServerEvent::Log(format!("[Mic] Uplink ended: {}", key_recv)))
+                .ok();
+        }
+        // v3.4：摄像头会话同样随连接结束而终止，清空邮箱并复位 GUI
+        if cam_session_recv.swap(false, Ordering::Relaxed) {
+            if let Ok(mut mb) = mgr_recv.cam_mailbox.lock() {
+                *mb = None;
+            }
+            if let Ok(mut mb) = mgr_recv.cam_mailbox_obs.lock() {
+                *mb = None;
+            }
+            event_tx_recv.send(ServerEvent::CamStopped).ok();
+            event_tx_recv
+                .send(ServerEvent::Log(format!("[Cam] Uplink ended: {}", key_recv)))
+                .ok();
+        }
     });
 
-    // Wait for either task to finish
-    tokio::select! {
-        _ = send_task => {},
-        _ = recv_task => {},
-    }
+    // 注意：不能用 select!（send_task 因 mic 摘除订阅而正常退出时会误关整条连接），
+    // 必须 join 等两个任务都结束
+    let _ = tokio::join!(send_task, recv_task);
 
     client_manager.remove_client(&client_key).await;
     event_tx.send(ServerEvent::ClientDisconnected(client_key)).ok();
+}
+
+// ── v3 麦克风上行支撑 ─────────────────────────────────────────────
+
+/// 从 JPEG 段结构中读出图像宽高（SOF 标记 0xC0..0xCF，跳过 DHT/C8/DAC）。
+/// 只扫段头不解析熵数据，开销极小，用于 GUI 显示"当前画质"。
+fn jpeg_dims(data: &[u8]) -> Option<(u16, u16)> {
+    if data.len() < 4 || data[0] != 0xFF || data[1] != 0xD8 {
+        return None;
+    }
+    let mut i = 2usize;
+    while i + 9 < data.len() {
+        if data[i] != 0xFF {
+            i += 1;
+            continue;
+        }
+        let marker = data[i + 1];
+        if (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) {
+            let h = u16::from_be_bytes([data[i + 5], data[i + 6]]);
+            let w = u16::from_be_bytes([data[i + 7], data[i + 8]]);
+            return if w > 0 && h > 0 { Some((w, h)) } else { None };
+        }
+        if marker == 0xD8 || marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+            i += 2;
+            continue;
+        }
+        let seg_len = u16::from_be_bytes([data[i + 2], data[i + 3]]) as usize;
+        i += 2 + seg_len.max(2);
+    }
+    None
+}
+
+/// 计算 PCM s16le 数据的 RMS 电平，归一化到 0.0 ~ 1.0
+fn rms_level(bytes: &[u8]) -> f32 {
+    let mut acc: f64 = 0.0;
+    let mut n: u64 = 0;
+    for chunk in bytes.chunks_exact(2) {
+        let s = i16::from_le_bytes([chunk[0], chunk[1]]) as f64;
+        acc += s * s;
+        n += 1;
+    }
+    if n == 0 {
+        0.0
+    } else {
+        ((acc / n as f64).sqrt() / 32768.0) as f32
+    }
+}
+
+/// 从压缩后的 JSON 文本中提取数字字段。
+/// 仅用于我们自定义的 mic_start 协议头，字段少且格式可控，不引入 serde。
+fn json_number(compact: &str, key: &str) -> Option<u64> {
+    let pat = format!("\"{}\":", key);
+    let idx = compact.find(&pat)? + pat.len();
+    let digits: String = compact[idx..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
 }

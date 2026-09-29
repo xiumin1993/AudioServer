@@ -24,6 +24,22 @@ pub type MicQueue = Arc<Mutex<VecDeque<i16>>>;
 /// 队列积压上限（样本数）。48kHz 下约 250ms，再大说明网络比实时快，丢旧保新。
 const MAX_QUEUE_SAMPLES: usize = 12000;
 
+// ── v3.4.4 上行采样率开关 + 重采样 ─────────────────────────────────
+/// 手机实际发来的 PCM 采样率（44100 / 48000），服务器收到 mic_start 时更新。
+/// 默认 48000：与声卡设备速率一致时，注入路径与旧版【逐字节相同】（零风险）；
+/// 只有用户在手机上主动切到 44.1k，泵里才会启用线性插值重采样，
+/// 否则把 44.1k 当 48k 直接写会音调变快、声音变尖。
+pub static UPLINK_RATE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(48000);
+
+/// 手机上报上行采样率时调用（非法值忽略，维持上一个好值）
+pub fn set_uplink_rate(sr: u32) {
+    if (8000..=192000).contains(&sr) {
+        UPLINK_RATE.store(sr, std::sync::atomic::Ordering::Relaxed);
+        info!("[MicOut] Uplink sample rate set to {} Hz", sr);
+    }
+}
+
 /// 目标设备名片段（VB-CABLE 的播放端叫 "CABLE Input"，大小写不敏感匹配）
 const CABLE_RENDER_HINT: &str = "CABLE INPUT";
 
@@ -290,6 +306,10 @@ mod windows_impl {
         }
         let ch = stream.channels as usize;
         let buf_frames = unsafe { stream.client.GetBufferSize() }.unwrap_or(1024);
+        // v3.4.4 重采样进位状态（仅上行速率≠设备速率时使用）：
+        // carry = 跨泵周期留存的少量上行样本；rpos = 读取位置相对 carry 头部的小数偏移
+        let mut carry: std::collections::VecDeque<i16> = std::collections::VecDeque::new();
+        let mut rpos: f64 = 0.0;
         loop {
             let padding: u32 = match unsafe { stream.client.GetCurrentPadding() } {
                 Ok(p) => p,
@@ -308,9 +328,47 @@ mod windows_impl {
             let frames = available as usize;
             let mut mono: Vec<i16> = Vec::with_capacity(frames);
             {
+                let urate = UPLINK_RATE.load(std::sync::atomic::Ordering::Relaxed);
+                let resample = urate != stream.sample_rate && urate >= 8000;
                 let mut q = queue.lock().unwrap();
-                for _ in 0..frames {
-                    mono.push(q.pop_front().unwrap_or(0));
+                if !resample {
+                    // 常见路径：速率一致，直接逐样本搬运（与旧版完全相同）
+                    for _ in 0..frames {
+                        mono.push(q.pop_front().unwrap_or(0));
+                    }
+                } else {
+                    // 线性插值重采样：每个设备样本 = 两个相邻上行样本的加权平均。
+                    // step = 平均每产出一个设备样本要消耗多少上行样本
+                    //（44.1k→48k 时 step≈0.91875）。
+                    let step = urate as f64 / stream.sample_rate as f64;
+                    let need = ((frames as f64 - 1.0) * step + rpos).ceil() as usize + 1;
+                    while carry.len() < need {
+                        carry.push_back(q.pop_front().unwrap_or(0));
+                    }
+                    for i in 0..frames {
+                        let p = rpos + i as f64 * step;
+                        let i0 = p as usize;
+                        let f = p - i0 as f64;
+                        let a = *carry.get(i0).unwrap_or(&0) as f64;
+                        let b = *carry
+                            .get(i0 + 1)
+                            .unwrap_or_else(|| carry.get(i0).unwrap_or(&0))
+                            as f64;
+                        mono.push((a * (1.0 - f) + b * f).round() as i16);
+                    }
+                    // 丢弃已经插值过去的前端样本，rpos 归到 [0,1) 区间
+                    let last_pos = rpos + (frames as f64 - 1.0) * step;
+                    let consumed = last_pos.floor() as usize;
+                    if consumed > 0 {
+                        for _ in 0..consumed.min(carry.len()) {
+                            carry.pop_front();
+                        }
+                    }
+                    rpos = last_pos - consumed as f64;
+                    // 保险阀：浮点抖动也不允许 carry 无限膨胀（正常应 ≤3 个）
+                    while carry.len() > 4 {
+                        carry.pop_front();
+                    }
                 }
             }
             unsafe {

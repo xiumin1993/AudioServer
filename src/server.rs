@@ -876,6 +876,8 @@ async fn handle_connection(
                     if compact.contains("\"type\":\"mic_start\"") && !mic_session {
                         let sr = json_number(&compact, "sample_rate").unwrap_or(48000) as u32;
                         let ch = json_number(&compact, "channels").unwrap_or(1) as u16;
+                        // v3.4.4：把上行采样率告知注入引擎（44.1k≠设备48k时启用重采样）
+                        mic_out::set_uplink_rate(sr);
                         mic_session = true;
                         // v3.1 修复：新会话一律重置全局静音标志。
                         // 否则上一个客户端按过静音后标志残留 true，

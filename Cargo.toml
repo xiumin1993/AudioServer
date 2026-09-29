@@ -2,6 +2,7 @@
 name = "audioserver"
 version = "0.1.0"
 edition = "2021"
+default-run = "audioserver"
 
 [dependencies]
 # 异步运行时
@@ -11,7 +12,18 @@ tokio = { version = "1.36", features = ["full"] }
 tokio-tungstenite = "0.21"
 futures-util = "0.3"
 
-# 音频捕获
+# 音频捕获 - Windows WASAPI loopback
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Media_Audio",
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_UI_Shell_PropertiesSystem",
+] }
+
+# 跨平台音频捕获（备用）
 cpal = "0.15"
 
 # 错误处理
@@ -21,8 +33,24 @@ anyhow = "1.0"
 log = "0.4"
 env_logger = "0.11"
 
-# 命令行参数
+# GUI
+eframe = "0.29"
+
+# 网络接口 - 获取本机 IP
+local-ip-address = "0.6"
+
+# CLI 参数 (仅 server 二进制使用)
 clap = { version = "4.5", features = ["derive"] }
+
+# GUI 默认二进制
+[[bin]]
+name = "audioserver"
+path = "src/main.rs"
+
+# CLI 无界面服务器
+[[bin]]
+name = "server"
+path = "src/bin/server.rs"
 
 [profile.release]
 opt-level = 3

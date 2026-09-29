@@ -1,1 +1,21 @@
-/target
+# Rust 编译产物
+/target/
+
+# Cargo 锁文件（库项目不提交，应用项目可提交）
+# Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 设计文件（不上传到仓库）
+ui-design*.html
+
+# 调试文件
+*.pdb

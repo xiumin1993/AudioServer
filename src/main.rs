@@ -1,290 +1,924 @@
-use anyhow::{Context, Result};
-use clap::Parser;
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleFormat, StreamConfig};
-use futures_util::{SinkExt, StreamExt};
-use log::{error, info, warn};
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
-use tokio_tungstenite::tungstenite::Message;
+use eframe::egui;
+use std::sync::mpsc;
+use std::time::Instant;
+use tokio::sync::mpsc as tokio_mpsc;
 
-/// PC 音频服务器 - 捕获系统音频并通过 WebSocket 流式传输
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    /// WebSocket 服务监听端口
-    #[arg(short, long, default_value = "8080")]
-    port: u16,
+use audioserver::server::{run_server, ServerCommand, ServerConfig, ServerEvent, ServerStatus};
 
-    /// 音频采样率
-    #[arg(short, long, default_value = "48000")]
-    sample_rate: u32,
+// ── v2 浅色主题配色 ──
+mod colors {
+    use eframe::egui::Color32;
 
-    /// 音频通道数
-    #[arg(short, long, default_value = "2")]
-    channels: u16,
+    // 背景
+    pub const BG_WHITE: Color32 = Color32::from_rgb(255, 255, 255);
+    pub const BG_LIGHT: Color32 = Color32::from_rgb(250, 250, 250);
+    // 边框
+    pub const BORDER: Color32 = Color32::from_rgb(229, 229, 229);
+    // 强调色（蓝）
+    pub const ACCENT: Color32 = Color32::from_rgb(37, 99, 235);
+    pub const ACCENT_BG: Color32 = Color32::from_rgb(240, 245, 255);
+    pub const ACCENT_BORDER: Color32 = Color32::from_rgb(208, 223, 255);
 
-    /// 缓冲区大小（采样点数）
-    #[arg(short, long, default_value = "1024")]
-    buffer_size: u32,
+    // 文字
+    pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(34, 34, 34);
+    pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(102, 102, 102);
+    pub const TEXT_MUTED: Color32 = Color32::from_rgb(153, 153, 153);
+    pub const TEXT_DISABLED: Color32 = Color32::from_rgb(187, 187, 187);
+
+    // 状态
+    pub const GREEN: Color32 = Color32::from_rgb(34, 197, 94);
+    pub const RED: Color32 = Color32::from_rgb(220, 38, 38);
+    pub const RED_BG: Color32 = Color32::from_rgb(254, 242, 242);
+    pub const RED_BORDER: Color32 = Color32::from_rgb(254, 202, 202);
+    pub const WARN_TEXT: Color32 = Color32::from_rgb(180, 83, 9);
+    pub const WARN_BG: Color32 = Color32::from_rgb(255, 251, 235);
+    pub const WARN_BORDER: Color32 = Color32::from_rgb(253, 230, 138);
+
+    // Toggle
+    pub const TOGGLE_ON: Color32 = Color32::from_rgb(34, 197, 94);
+    pub const TOGGLE_OFF: Color32 = Color32::from_rgb(221, 221, 221);
 }
 
-/// 客户端连接管理器
-struct ClientManager {
-    clients: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Vec<u8>>>>>,
-    next_id: AtomicU64,
-}
-
-impl ClientManager {
-    fn new() -> Self {
-        Self {
-            clients: Arc::new(Mutex::new(HashMap::new())),
-            next_id: AtomicU64::new(1),
-        }
-    }
-
-    async fn add_client(&self) -> (u64, mpsc::UnboundedReceiver<Vec<u8>>) {
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let (tx, rx) = mpsc::unbounded_channel();
-        self.clients.lock().await.insert(id, tx);
-        info!("客户端已连接: ID={}, 当前连接数: {}", id, self.clients.lock().await.len());
-        (id, rx)
-    }
-
-    async fn remove_client(&self, id: u64) {
-        self.clients.lock().await.remove(&id);
-        info!("客户端已断开: ID={}, 当前连接数: {}", id, self.clients.lock().await.len());
-    }
-
-    async fn broadcast(&self, data: &[u8]) {
-        let clients = self.clients.lock().await;
-        let mut failed_clients = Vec::new();
-
-        for (id, tx) in clients.iter() {
-            if tx.send(data.to_vec()).is_err() {
-                failed_clients.push(*id);
-            }
-        }
-
-        // 清理失败的客户端
-        if !failed_clients.is_empty() {
-            drop(clients);
-            let mut clients = self.clients.lock().await;
-            for id in failed_clients {
-                clients.remove(&id);
-            }
-        }
-    }
-}
-
-/// 启动音频捕获
-fn start_audio_capture(
-    sample_rate: u32,
-    channels: u16,
-    buffer_size: u32,
-    client_manager: Arc<ClientManager>,
-) -> Result<()> {
-    let host = cpal::default_host();
-
-    // 尝试获取默认输出设备进行 loopback 捕获
-    let device = host
-        .default_output_device()
-        .context("未找到默认输出设备")?;
-
-    info!("使用音频设备: {}", device.name()?);
-
-    // 配置音频流
-    let config = StreamConfig {
-        channels: channels.into(),
-        sample_rate: cpal::SampleRate(sample_rate),
-        buffer_size: cpal::BufferSize::Fixed(buffer_size),
-    };
-
-    let client_manager_clone = client_manager.clone();
-
-    // 创建音频流回调
-    let err_fn = move |err| {
-        error!("音频流错误: {}", err);
-    };
-
-    // 根据采样格式选择数据处理方式
-    let sample_format = device.default_output_config()
-        .context("无法获取默认输出配置")?
-        .sample_format();
-
-    let stream = match sample_format {
-        SampleFormat::I16 => device.build_input_stream(
-            &config,
-            move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                let bytes = unsafe {
-                    std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2)
-                };
-                let manager = client_manager_clone.clone();
-                tokio::spawn(async move {
-                    manager.broadcast(bytes).await;
-                });
-            },
-            err_fn,
-            None,
-        ),
-        SampleFormat::F32 => device.build_input_stream(
-            &config,
-            move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                // 将 f32 转换为 i16
-                let i16_data: Vec<i16> = data.iter()
-                    .map(|&s| (s * 32767.0) as i16)
-                    .collect();
-                let bytes = unsafe {
-                    std::slice::from_raw_parts(i16_data.as_ptr() as *const u8, i16_data.len() * 2)
-                };
-                let manager = client_manager_clone.clone();
-                tokio::spawn(async move {
-                    manager.broadcast(bytes).await;
-                });
-            },
-            err_fn,
-            None,
-        ),
-        _ => {
-            anyhow::bail!("不支持的采样格式: {:?}", sample_format);
-        }
-    }?;
-
-    stream.play()?;
-    info!("音频捕获已启动: {}Hz, {}通道, 缓冲区: {}采样点",
-          sample_rate, channels, buffer_size);
-
-    // 保持流活跃
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(3600));
-        }
-    });
-
-    Ok(())
-}
-
-/// 处理 WebSocket 连接
-async fn handle_connection(
-    stream: TcpStream,
-    client_manager: Arc<ClientManager>,
-) {
-    let addr = stream.peer_addr().unwrap_or_else(|_| "unknown".parse().unwrap());
-    info!("新的 TCP 连接来自: {}", addr);
-
-    let ws_stream = match tokio_tungstenite::accept_async(stream).await {
-        Ok(ws) => ws,
-        Err(e) => {
-            error!("WebSocket 握手失败: {}", e);
-            return;
-        }
-    };
-
-    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
-    let (client_id, mut audio_rx) = client_manager.add_client().await;
-
-    // 发送音频格式信息（JSON 头部）
-    let header = format!(
-        r#"{{"type":"audio_config","sample_rate":48000,"channels":2,"format":"pcm_s16le"}}"#
-    );
-    if let Err(e) = ws_sender.send(Message::Text(header)).await {
-        error!("发送头部失败: {}", e);
-        client_manager.remove_client(client_id).await;
-        return;
-    }
-
-    // 创建任务发送音频数据
-    let send_task = tokio::spawn(async move {
-        while let Some(data) = audio_rx.recv().await {
-            if ws_sender.send(Message::Binary(data)).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    // 接收客户端消息（用于心跳或控制命令）
-    let recv_task = tokio::spawn(async move {
-        while let Some(msg) = ws_receiver.next().await {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    info!("收到客户端消息: {}", text);
-                }
-                Ok(Message::Close(_)) => {
-                    info!("客户端请求关闭连接");
-                    break;
-                }
-                Err(e) => {
-                    warn!("接收消息错误: {}", e);
-                    break;
-                }
-                _ => {}
-            }
-        }
-    });
-
-    // 等待任一任务完成
-    tokio::select! {
-        _ = send_task => {},
-        _ = recv_task => {},
-    }
-
-    client_manager.remove_client(client_id).await;
-}
-
-/// 启动 WebSocket 服务器
-async fn start_websocket_server(port: u16, client_manager: Arc<ClientManager>) -> Result<()> {
-    let addr = format!("0.0.0.0:{}", port);
-    let listener = TcpListener::bind(&addr).await?;
-    info!("WebSocket 服务器已启动，监听端口: {}", port);
-    info!("连接地址: ws://<你的电脑IP>:{}/ws/audio", port);
-
-    loop {
-        let (stream, addr) = listener.accept().await?;
-        info!("新连接: {}", addr);
-
-        let manager = client_manager.clone();
-        tokio::spawn(async move {
-            handle_connection(stream, manager).await;
-        });
-    }
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    // 初始化日志
+fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_millis()
         .init();
 
-    let args = Args::parse();
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([420.0, 540.0])
+            .with_resizable(true),
+        ..Default::default()
+    };
 
-    info!("=== PC 音频服务器 ===");
-    info!("配置: 端口={}, 采样率={}Hz, 通道数={}, 缓冲区={}",
-          args.port, args.sample_rate, args.channels, args.buffer_size);
+    eframe::run_native(
+        "Audio Server",
+        options,
+        Box::new(|cc| {
+            // 基于 egui 浅色主题，只覆盖需要的颜色
+            let mut visuals = egui::Visuals::light();
+            visuals.override_text_color = Some(colors::TEXT_PRIMARY);
+            visuals.hyperlink_color = colors::ACCENT;
+            visuals.faint_bg_color = colors::BG_LIGHT;
+            visuals.extreme_bg_color = colors::BG_LIGHT;
+            visuals.window_stroke = egui::Stroke::new(1.0_f32, colors::BORDER);
+            visuals.widgets.noninteractive.bg_fill = colors::BG_WHITE;
+            visuals.widgets.noninteractive.fg_stroke =
+                egui::Stroke::new(1.0_f32, colors::TEXT_SECONDARY);
+            visuals.widgets.inactive.bg_fill = colors::BG_WHITE;
+            visuals.widgets.inactive.fg_stroke =
+                egui::Stroke::new(1.0_f32, colors::TEXT_PRIMARY);
+            visuals.widgets.hovered.bg_fill = colors::BG_LIGHT;
+            visuals.widgets.hovered.fg_stroke =
+                egui::Stroke::new(1.0_f32, colors::TEXT_PRIMARY);
+            visuals.widgets.active.bg_fill = colors::ACCENT_BG;
+            visuals.widgets.active.fg_stroke =
+                egui::Stroke::new(1.0_f32, colors::ACCENT);
+            visuals.selection.bg_fill =
+                egui::Color32::from_rgba_premultiplied(37, 99, 235, 30);
+            visuals.selection.stroke = egui::Stroke::new(1.0_f32, colors::ACCENT);
+            cc.egui_ctx.set_visuals(visuals);
 
-    // 创建客户端管理器
-    let client_manager = Arc::new(ClientManager::new());
+            Ok(Box::new(AudioServerApp::new()))
+        }),
+    )
+}
 
-    // 启动音频捕获
-    let capture_manager = client_manager.clone();
-    std::thread::spawn(move || {
-        if let Err(e) = start_audio_capture(
-            args.sample_rate,
-            args.channels,
-            args.buffer_size,
-            capture_manager,
-        ) {
-            error!("音频捕获失败: {}", e);
-            std::process::exit(1);
+// ── Tab 枚举 ──
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum AppTab {
+    Connection,
+    Settings,
+    Log,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
+enum ConnectionType {
+    Wifi,
+    Usb,
+    Bluetooth,
+}
+
+struct AudioServerApp {
+    port: String,
+    sample_rate: String,
+    channels: String,
+    buffer_size: String,
+    connection_type: ConnectionType,
+    server_status: ServerStatus,
+    server_handle: Option<std::thread::JoinHandle<()>>,
+    cmd_tx: Option<tokio_mpsc::UnboundedSender<ServerCommand>>,
+    event_rx: Option<mpsc::Receiver<ServerEvent>>,
+    client_count: u64,
+    logs: Vec<String>,
+    #[allow(dead_code)]
+    device_name: String,
+    active_tab: AppTab,
+    start_time: Option<Instant>,
+}
+
+impl AudioServerApp {
+    fn new() -> Self {
+        let mut app = Self {
+            port: "8080".to_string(),
+            sample_rate: "48000".to_string(),
+            channels: "2".to_string(),
+            buffer_size: "1024".to_string(),
+            connection_type: ConnectionType::Wifi,
+            server_status: ServerStatus::Stopped,
+            server_handle: None,
+            cmd_tx: None,
+            event_rx: None,
+            client_count: 0,
+            logs: Vec::new(),
+            device_name: String::new(),
+            active_tab: AppTab::Connection,
+            start_time: None,
+        };
+        // 启动时自动开启服务，不用手动点 Toggle
+        app.start_server();
+        app
+    }
+
+    fn poll_server_events(&mut self) {
+        let mut events = Vec::new();
+        if let Some(rx) = &self.event_rx {
+            for _ in 0..50 {
+                match rx.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.server_status = ServerStatus::Stopped;
+                        self.cmd_tx = None;
+                        self.event_rx = None;
+                        self.start_time = None;
+                        self.add_log("Server process ended".to_string());
+                        return;
+                    }
+                }
+            }
         }
-    });
+        for event in events {
+            self.handle_event(event);
+        }
+    }
 
-    // 等待一小段时间让音频捕获启动
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    fn handle_event(&mut self, event: ServerEvent) {
+        match event {
+            ServerEvent::Log(msg) => self.add_log(msg),
+            ServerEvent::StatusChanged(status) => {
+                self.server_status = status;
+                if status == ServerStatus::Running {
+                    self.start_time = Some(Instant::now());
+                } else {
+                    self.start_time = None;
+                }
+            }
+            ServerEvent::ClientConnected(_id) => self.client_count += 1,
+            ServerEvent::ClientDisconnected(_id) => {
+                self.client_count = self.client_count.saturating_sub(1);
+            }
+            ServerEvent::Error(msg) => {
+                self.add_log(format!("[Error] {}", msg));
+            }
+        }
+    }
 
-    // 启动 WebSocket 服务器
-    start_websocket_server(args.port, client_manager).await
+    fn add_log(&mut self, msg: String) {
+        let timestamp = chrono_now();
+        self.logs.push(format!("[{}] {}", timestamp, msg));
+        if self.logs.len() > 200 {
+            self.logs.drain(0..50);
+        }
+    }
+
+    fn start_server(&mut self) {
+        if self.server_status == ServerStatus::Running {
+            return;
+        }
+        let config = ServerConfig {
+            port: self.port.parse().unwrap_or(8080),
+            sample_rate: self.sample_rate.parse().unwrap_or(48000),
+            channels: self.channels.parse().unwrap_or(2),
+            buffer_size: self.buffer_size.parse().unwrap_or(1024),
+        };
+        let (event_tx, event_rx) = mpsc::channel();
+        let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel();
+        self.event_rx = Some(event_rx);
+        self.cmd_tx = Some(cmd_tx);
+        self.client_count = 0;
+        self.logs.clear();
+        self.start_time = Some(Instant::now());
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(run_server(config, event_tx, cmd_rx));
+        });
+        self.server_handle = Some(handle);
+        self.add_log("Starting server...".to_string());
+    }
+
+    fn stop_server(&mut self) {
+        if let Some(tx) = &self.cmd_tx {
+            tx.send(ServerCommand::Stop).ok();
+        }
+        self.cmd_tx = None;
+        self.event_rx = None;
+        self.server_handle = None;
+        self.server_status = ServerStatus::Stopped;
+        self.start_time = None;
+        self.add_log("Stop command sent".to_string());
+    }
+
+    fn get_local_ip() -> String {
+        local_ip_address::local_ip()
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|_| "Unknown".to_string())
+    }
+
+    fn uptime_str(&self) -> String {
+        match self.start_time {
+            Some(start) => {
+                let elapsed = start.elapsed().as_secs();
+                let h = elapsed / 3600;
+                let m = (elapsed % 3600) / 60;
+                let s = elapsed % 60;
+                format!("{:02}:{:02}:{:02}", h, m, s)
+            }
+            None => "00:00:00".to_string(),
+        }
+    }
+
+    fn audio_summary(&self) -> String {
+        format!("{}Hz · {}ch · PCM", self.sample_rate, self.channels)
+    }
+
+    // ── Header：状态 + 开关 ──
+    fn show_header(&mut self, ui: &mut egui::Ui, is_running: bool) {
+        ui.horizontal(|ui| {
+            // 小圆点状态指示器
+            let dot_size = 12.0_f32;
+            let (dot_rect, _) = ui.allocate_exact_size(
+                egui::vec2(dot_size, dot_size),
+                egui::Sense::hover(),
+            );
+            if ui.is_rect_visible(dot_rect) {
+                let dot_color = if is_running {
+                    colors::GREEN
+                } else {
+                    colors::TEXT_DISABLED
+                };
+                ui.painter()
+                    .circle_filled(dot_rect.center(), dot_size / 2.0, dot_color);
+            }
+
+            ui.add_space(10.0);
+
+            // 状态文字
+            ui.vertical(|ui| {
+                let title = if is_running {
+                    "Server Running"
+                } else {
+                    "Server Stopped"
+                };
+                ui.label(
+                    egui::RichText::new(title)
+                        .size(15.0)
+                        .strong()
+                        .color(colors::TEXT_PRIMARY),
+                );
+                let subtitle = if is_running {
+                    format!("Uptime {}", self.uptime_str())
+                } else {
+                    "Toggle to start".to_string()
+                };
+                ui.label(
+                    egui::RichText::new(subtitle)
+                        .size(11.0)
+                        .color(colors::TEXT_MUTED),
+                );
+            });
+
+            // Toggle 开关
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let toggle_w = 44.0_f32;
+                let toggle_h = 24.0_f32;
+                let (toggle_rect, toggle_resp) = ui.allocate_exact_size(
+                    egui::vec2(toggle_w, toggle_h),
+                    egui::Sense::click(),
+                );
+                if toggle_resp.clicked() {
+                    if is_running {
+                        self.stop_server();
+                    } else {
+                        self.start_server();
+                    }
+                }
+                if ui.is_rect_visible(toggle_rect) {
+                    let knob_r = 10.0_f32;
+                    let knob_y = toggle_rect.center().y;
+                    let knob_x = if is_running {
+                        toggle_rect.right() - 12.0_f32
+                    } else {
+                        toggle_rect.left() + 12.0_f32
+                    };
+                    let bg_color = if is_running {
+                        colors::TOGGLE_ON
+                    } else {
+                        colors::TOGGLE_OFF
+                    };
+                    ui.painter().rect_filled(
+                        toggle_rect,
+                        egui::Rounding::same(toggle_h / 2.0),
+                        bg_color,
+                    );
+                    // 白色旋钮，带一点阴影感
+                    ui.painter().circle_filled(
+                        egui::pos2(knob_x, knob_y),
+                        knob_r,
+                        egui::Color32::WHITE,
+                    );
+                    ui.painter().circle_stroke(
+                        egui::pos2(knob_x, knob_y),
+                        knob_r,
+                        egui::Stroke::new(
+                            0.5_f32,
+                            egui::Color32::from_rgba_premultiplied(0, 0, 0, 25),
+                        ),
+                    );
+                }
+                if toggle_resp.hovered() {
+                    ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+                }
+            });
+        });
+    }
+
+    // ── Tab 栏 ──
+    fn show_tabs(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.set_height(38.0);
+            let tabs = [
+                (AppTab::Connection, "Connection"),
+                (AppTab::Settings, "Settings"),
+                (AppTab::Log, "Log"),
+            ];
+            let total_width = ui.available_width();
+            let tab_width = total_width / tabs.len() as f32;
+
+            for (tab, label) in &tabs {
+                let is_active = self.active_tab == *tab;
+                let (tab_rect, tab_resp) = ui.allocate_exact_size(
+                    egui::vec2(tab_width, 38.0),
+                    egui::Sense::click(),
+                );
+                if tab_resp.clicked() {
+                    self.active_tab = *tab;
+                }
+                if ui.is_rect_visible(tab_rect) {
+                    // 选中态：底部蓝色指示线
+                    if is_active {
+                        let line_h = 2.0_f32;
+                        let line_rect = egui::Rect::from_min_size(
+                            egui::pos2(tab_rect.left(), tab_rect.bottom() - line_h),
+                            egui::vec2(tab_rect.width(), line_h),
+                        );
+                        ui.painter()
+                            .rect_filled(line_rect, egui::Rounding::ZERO, colors::ACCENT);
+                    }
+                    let text_color = if is_active {
+                        colors::ACCENT
+                    } else {
+                        colors::TEXT_MUTED
+                    };
+                    let galley = ui.fonts(|f| {
+                        f.layout_no_wrap(
+                            label.to_string(),
+                            egui::FontId::proportional(13.0),
+                            text_color,
+                        )
+                    });
+                    let text_pos = egui::pos2(
+                        tab_rect.center().x - galley.size().x / 2.0,
+                        tab_rect.center().y - galley.size().y / 2.0,
+                    );
+                    ui.painter().galley(text_pos, galley, text_color);
+                }
+                if tab_resp.hovered() {
+                    ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+                }
+            }
+        });
+    }
+
+    // ── Footer ──
+    fn show_footer(&self, ui: &mut egui::Ui, is_running: bool) {
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                    .size(10.0)
+                    .color(colors::TEXT_DISABLED),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let summary = if is_running {
+                    self.audio_summary()
+                } else {
+                    "Idle".to_string()
+                };
+                ui.label(
+                    egui::RichText::new(summary)
+                        .size(10.0)
+                        .color(colors::TEXT_DISABLED),
+                );
+                ui.add_space(6.0);
+                let dot_size = 6.0_f32;
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(dot_size, dot_size),
+                    egui::Sense::hover(),
+                );
+                if ui.is_rect_visible(rect) {
+                    let dot_color = if is_running {
+                        colors::GREEN
+                    } else {
+                        colors::TEXT_DISABLED
+                    };
+                    ui.painter()
+                        .circle_filled(rect.center(), dot_size / 2.0, dot_color);
+                }
+            });
+        });
+    }
+
+    // ── Connection Tab ──
+    fn show_connection_tab(&mut self, ui: &mut egui::Ui) {
+        let local_ip = Self::get_local_ip();
+
+        // 连接方式按钮行
+        ui.horizontal(|ui| {
+            ui.set_height(56.0);
+            let conns = [
+                (ConnectionType::Wifi, "WiFi LAN", true),
+                (ConnectionType::Usb, "USB", false),
+                (ConnectionType::Bluetooth, "Bluetooth", false),
+            ];
+            let gap = 8.0_f32;
+            let btn_w = (ui.available_width() - gap * 2.0) / 3.0;
+
+            for (ct, label, enabled) in &conns {
+                let is_active = self.connection_type == *ct && *enabled;
+                let (resp_rect, resp) = ui.allocate_exact_size(
+                    egui::vec2(btn_w, 52.0),
+                    if *enabled {
+                        egui::Sense::click()
+                    } else {
+                        egui::Sense::hover()
+                    },
+                );
+                if ui.is_rect_visible(resp_rect) {
+                    let (bg, border, text_color) = if is_active {
+                        (colors::ACCENT_BG, colors::ACCENT, colors::ACCENT)
+                    } else if *enabled {
+                        (colors::BG_WHITE, colors::BORDER, colors::TEXT_SECONDARY)
+                    } else {
+                        (colors::BG_WHITE, colors::BORDER, colors::TEXT_DISABLED)
+                    };
+                    ui.painter().rect(
+                        resp_rect,
+                        egui::Rounding::same(8.0),
+                        bg,
+                        egui::Stroke::new(1.0_f32, border),
+                    );
+                    // 标签文字居中
+                    let galley = ui.fonts(|f| {
+                        f.layout_no_wrap(
+                            label.to_string(),
+                            egui::FontId::proportional(12.0),
+                            text_color,
+                        )
+                    });
+                    let text_pos = egui::pos2(
+                        resp_rect.center().x - galley.size().x / 2.0,
+                        resp_rect.center().y - galley.size().y / 2.0,
+                    );
+                    ui.painter().galley(text_pos, galley, text_color);
+                }
+                if resp.clicked() && *enabled {
+                    self.connection_type = *ct;
+                }
+                if resp.hovered() && *enabled {
+                    ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+                }
+            }
+        });
+
+        ui.add_space(4.0);
+
+        // 连接信息卡片
+        let card_frame = egui::Frame::none()
+            .fill(colors::BG_WHITE)
+            .stroke(egui::Stroke::new(1.0_f32, colors::BORDER))
+            .rounding(8.0)
+            .inner_margin(egui::Margin::same(14.0));
+
+        card_frame.show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("CONNECTION INFO")
+                    .size(11.0)
+                    .color(colors::TEXT_MUTED),
+            );
+            ui.add_space(8.0);
+
+            // IP 行
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Local IP")
+                        .size(13.0)
+                        .color(colors::TEXT_SECONDARY),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("Copy").size(10.0).color(colors::ACCENT),
+                            )
+                            .fill(colors::ACCENT_BG)
+                            .stroke(egui::Stroke::new(1.0_f32, colors::ACCENT_BORDER))
+                            .rounding(4.0),
+                        )
+                        .clicked()
+                    {
+                        ui.output_mut(|o| o.copied_text = local_ip.clone());
+                    }
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(&local_ip)
+                            .monospace()
+                            .size(13.0)
+                            .color(colors::ACCENT),
+                    );
+                });
+            });
+
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(6.0);
+
+            // WebSocket 地址
+            let ws_addr = format!("ws://{}:{}/ws/audio", local_ip, self.port);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("WebSocket")
+                        .size(13.0)
+                        .color(colors::TEXT_SECONDARY),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("Copy").size(10.0).color(colors::ACCENT),
+                            )
+                            .fill(colors::ACCENT_BG)
+                            .stroke(egui::Stroke::new(1.0_f32, colors::ACCENT_BORDER))
+                            .rounding(4.0),
+                        )
+                        .clicked()
+                    {
+                        ui.output_mut(|o| o.copied_text = ws_addr.clone());
+                    }
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(&ws_addr)
+                            .monospace()
+                            .size(11.0)
+                            .color(colors::ACCENT),
+                    );
+                });
+            });
+        });
+
+        ui.add_space(4.0);
+
+        // 客户端数量卡片
+        let client_frame = egui::Frame::none()
+            .fill(colors::BG_WHITE)
+            .stroke(egui::Stroke::new(1.0_f32, colors::BORDER))
+            .rounding(8.0)
+            .inner_margin(egui::Margin::same(14.0));
+
+        client_frame.show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let count_color = if self.client_count > 0 {
+                    colors::ACCENT
+                } else {
+                    colors::TEXT_DISABLED
+                };
+                ui.label(
+                    egui::RichText::new(format!("{}", self.client_count))
+                        .size(28.0)
+                        .strong()
+                        .color(count_color),
+                );
+                ui.add_space(8.0);
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new("Connected Clients")
+                            .size(12.0)
+                            .color(colors::TEXT_MUTED),
+                    );
+                    if self.client_count == 0 {
+                        ui.label(
+                            egui::RichText::new("Waiting...")
+                                .size(11.0)
+                                .color(colors::TEXT_DISABLED),
+                        );
+                    }
+                });
+            });
+        });
+    }
+
+    // ── Settings Tab ──
+    fn show_settings_tab(&mut self, ui: &mut egui::Ui, is_running: bool) {
+        // 运行时锁定提示
+        if is_running {
+            let warn_frame = egui::Frame::none()
+                .fill(colors::WARN_BG)
+                .stroke(egui::Stroke::new(1.0_f32, colors::WARN_BORDER))
+                .rounding(6.0)
+                .inner_margin(egui::Margin::symmetric(12.0, 8.0));
+
+            warn_frame.show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("\u{26A0}").size(14.0).color(colors::WARN_TEXT));
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new("Stop the server to change settings.")
+                            .size(12.0)
+                            .color(colors::WARN_TEXT),
+                    );
+                });
+            });
+            ui.add_space(8.0);
+        }
+
+        // 音频参数卡片
+        let audio_frame = egui::Frame::none()
+            .fill(colors::BG_WHITE)
+            .stroke(egui::Stroke::new(1.0_f32, colors::BORDER))
+            .rounding(8.0)
+            .inner_margin(egui::Margin::same(14.0));
+
+        audio_frame.show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("AUDIO")
+                    .size(11.0)
+                    .color(colors::TEXT_MUTED),
+            );
+            ui.add_space(8.0);
+            ui.add_enabled_ui(!is_running, |ui| {
+                egui::Grid::new("audio_settings")
+                    .num_columns(2)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new("Sample Rate")
+                                .size(13.0)
+                                .color(colors::TEXT_SECONDARY),
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.sample_rate)
+                                        .desired_width(80.0)
+                                        .horizontal_align(egui::Align::RIGHT),
+                                );
+                            },
+                        );
+                        ui.end_row();
+
+                        ui.label(
+                            egui::RichText::new("Channels")
+                                .size(13.0)
+                                .color(colors::TEXT_SECONDARY),
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.channels)
+                                        .desired_width(80.0)
+                                        .horizontal_align(egui::Align::RIGHT),
+                                );
+                            },
+                        );
+                        ui.end_row();
+
+                        ui.label(
+                            egui::RichText::new("Buffer Size")
+                                .size(13.0)
+                                .color(colors::TEXT_SECONDARY),
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.buffer_size)
+                                        .desired_width(80.0)
+                                        .horizontal_align(egui::Align::RIGHT),
+                                );
+                            },
+                        );
+                        ui.end_row();
+                    });
+            });
+        });
+
+        ui.add_space(8.0);
+
+        // 网络参数卡片
+        let net_frame = egui::Frame::none()
+            .fill(colors::BG_WHITE)
+            .stroke(egui::Stroke::new(1.0_f32, colors::BORDER))
+            .rounding(8.0)
+            .inner_margin(egui::Margin::same(14.0));
+
+        net_frame.show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("NETWORK")
+                    .size(11.0)
+                    .color(colors::TEXT_MUTED),
+            );
+            ui.add_space(8.0);
+            ui.add_enabled_ui(!is_running, |ui| {
+                egui::Grid::new("net_settings")
+                    .num_columns(2)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new("Port")
+                                .size(13.0)
+                                .color(colors::TEXT_SECONDARY),
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.port)
+                                        .desired_width(80.0)
+                                        .horizontal_align(egui::Align::RIGHT),
+                                );
+                            },
+                        );
+                        ui.end_row();
+                    });
+            });
+        });
+    }
+
+    // ── Log Tab ──
+    fn show_log_tab(&mut self, ui: &mut egui::Ui) {
+        // 工具栏
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("RUNTIME LOG")
+                    .size(11.0)
+                    .color(colors::TEXT_MUTED),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new("Clear").size(11.0).color(colors::RED),
+                        )
+                        .fill(colors::RED_BG)
+                        .stroke(egui::Stroke::new(1.0_f32, colors::RED_BORDER))
+                        .rounding(4.0),
+                    )
+                    .clicked()
+                {
+                    self.logs.clear();
+                }
+            });
+        });
+
+        ui.add_space(4.0);
+
+        // 日志区域
+        let log_frame = egui::Frame::none()
+            .fill(colors::BG_LIGHT)
+            .stroke(egui::Stroke::new(1.0_f32, colors::BORDER))
+            .rounding(6.0)
+            .inner_margin(egui::Margin::same(10.0));
+
+        let available_height = ui.available_height() - 4.0;
+        log_frame.show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .max_height(available_height)
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    if self.logs.is_empty() {
+                        ui.label(
+                            egui::RichText::new("No logs yet")
+                                .size(12.0)
+                                .color(colors::TEXT_DISABLED),
+                        );
+                    }
+                    for log in &self.logs {
+                        let color = if log.contains("[Error]") {
+                            colors::RED
+                        } else if log.contains("started")
+                            || log.contains("connected")
+                            || log.contains("Device")
+                        {
+                            colors::GREEN
+                        } else {
+                            colors::TEXT_SECONDARY
+                        };
+                        ui.label(
+                            egui::RichText::new(log)
+                                .monospace()
+                                .size(11.0)
+                                .color(color),
+                        );
+                    }
+                });
+        });
+    }
+}
+
+impl eframe::App for AudioServerApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_server_events();
+        let is_running = self.server_status == ServerStatus::Running;
+
+        // 顶部面板：Header
+        egui::TopBottomPanel::top("header_panel")
+            .frame(
+                egui::Frame::none()
+                    .fill(colors::BG_WHITE)
+                    .inner_margin(egui::Margin::symmetric(16.0, 14.0)),
+            )
+            .show(ctx, |ui| {
+                self.show_header(ui, is_running);
+            });
+
+        // 顶部面板：Tab 栏
+        egui::TopBottomPanel::top("tab_panel")
+            .frame(
+                egui::Frame::none()
+                    .fill(colors::BG_WHITE)
+                    .inner_margin(egui::Margin::symmetric(0.0, 0.0)),
+            )
+            .show(ctx, |ui| {
+                self.show_tabs(ui);
+            });
+
+        // 底部面板：Footer
+        egui::TopBottomPanel::bottom("footer_panel")
+            .frame(
+                egui::Frame::none()
+                    .fill(colors::BG_LIGHT)
+                    .inner_margin(egui::Margin::symmetric(16.0, 6.0)),
+            )
+            .show(ctx, |ui| {
+                self.show_footer(ui, is_running);
+            });
+
+        // 中央面板：Tab 内容
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::none()
+                    .fill(colors::BG_WHITE)
+                    .inner_margin(egui::Margin::same(16.0)),
+            )
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                match self.active_tab {
+                    AppTab::Connection => self.show_connection_tab(ui),
+                    AppTab::Settings => self.show_settings_tab(ui, is_running),
+                    AppTab::Log => self.show_log_tab(ui),
+                }
+            });
+
+        ctx.request_repaint();
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if self.server_status == ServerStatus::Running {
+            self.stop_server();
+        }
+    }
+}
+
+fn chrono_now() -> String {
+    use std::time::SystemTime;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs() % 86400;
+    let hours = secs / 3600;
+    let minutes = (secs % 3600) / 60;
+    let seconds = secs % 60;
+    format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
 }

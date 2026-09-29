@@ -1,6 +1,6 @@
 # Audio Server（PC 端服务器）
 
-把 Windows 电脑变成"音频/视频交换中心"：手机当电脑的**外放音箱**、**麦克风**、**网络摄像头**，全部走局域网 WebSocket 实时传输，端到端延迟 100ms 以内。
+把 Windows 电脑变成"音频/视频交换中心"：手机当电脑的**外放音箱**、**麦克风**、**网络摄像头**，全部走局域网 WebSocket 实时传输，端到端延迟 100ms 以内。（macOS 作为服务器：音频双通路见 §8；iPhone 连本 Windows 服务器零改动可用作 §8.6）
 
 本仓库是电脑端：一个 Rust 编写的 egui 图形界面服务器。手机端见姊妹仓库 `PCAssistant`（Flutter）。
 
@@ -110,3 +110,58 @@ third_party/     UnityCapture 官方源码+安装包（MIT）
 ```
 
 协议：文本 JSON 控制帧 + 二进制媒体帧。麦克风 PCM 无标记直传；摄像头 JPEG 帧带 4 字节魔术头 `[0x03,'C','A','M']` 分流。
+
+---
+
+## 8. macOS 移植（v3.5，音频双通路已实现，待 Mac 首编验证）
+
+> 状态：`mic_out.rs` / `server.rs` 的 macOS 实现（`#[cfg(target_os = "macos")]`）已按 cpal 0.15 与 CoreAudio API 写好，Windows 生产路径零影响。**这段代码在 Windows 上无法编译验证**（coreaudio-sys 绑定必须在苹果环境生成），到 Mac 上首次 `cargo build --release` 若报错属预期，逐个修即可，逻辑框架不变。
+
+### 8.1 为什么 Mac 比 Windows 麻烦
+
+macOS **没有** Windows WASAPI loopback 那种"直接录声卡输出"的系统能力，也**禁止**第三方内核态驱动。两个方向都要靠用户态虚拟声卡 BlackHole 转发，且要用"多输出设备"把系统声音一分为二。
+
+### 8.2 前置条件（按顺序做）
+
+| # | 步骤 | 说明 |
+|---|------|------|
+| 1 | 装 Rust：`rustup` 稳定版 | 与 Windows 同 |
+| 2 | 装 BlackHole **两个实例**：2ch + 16ch | <https://github.com/ExistentialAudio/BlackHole> 的 .pkg 安装（安装界面可勾选两个变体）；首次加载去 系统设置→隐私与安全性 放行。一设备一用途：16ch 收系统声（下行），2ch 注手机麦（上行），互不干扰，占用检测才不会被自己点着 |
+| 3 | 创建"多输出设备" | 打开 **音频 MIDI 设置**（Launchpad 搜 "Audio MIDI Setup"）→ 左下角 ＋ → 创建多输出设备 → 勾选【你的扬声器 + BlackHole 16ch】 |
+| 4 | 系统声音输出指到该多输出设备 | 系统设置 → 声音 → 输出 选"多输出设备"。这样电脑发声的同时被抄送进 BlackHole，服务器才有东西可录 |
+| 5 | 会议/录音软件输入选 BlackHole 2ch | 对应 Windows 上选 "CABLE Output" 的那一步 |
+
+### 8.3 数据流（对照 Windows）
+
+```
+下行(当音箱)：  系统声音 →[多输出设备]→ BlackHole 16ch 输入侧 →cpal捕获→ AudioServer →WebSocket→ 手机扬声器
+上行(当麦克风)：手机 →WebSocket→ AudioServer →cpal渲染→ BlackHole 2ch 输出侧 →会议软件从"BlackHole 2ch"录音
+摄像头：       macOS 需 CoreMediaIO Camera Extension，本仓库暂未实现（见 §8.5）
+```
+
+设备名匹配默认值：下行捕获找 `BlackHole 16ch`、上行注入找 `BlackHole 2ch`。不一致时用环境变量覆盖（子串匹配、大小写不敏感）：
+
+```bash
+PCSPEAKER_CAPTURE_DEVICE="blackhole 16ch" \
+PCSPEAKER_INJECT_DEVICE="blackhole 2ch" \
+./target/release/audioserver
+```
+
+### 8.4 编译与运行
+
+```bash
+cargo build --release        # 在 Mac 本机原生编译
+./target/release/audioserver # egui 图形界面与 Windows 版完全相同
+```
+
+首次编译若报错，位置几乎必在 `src/mic_out.rs` 的 `macos_impl`（盲写代码与真实 FFI 签名的差异），按报错逐行修即可，架构不用动。
+
+麦克风占用检测（驱动手机"按需录音"的 mic_state 信号）用 CoreAudio `IsRunningSomewhere` 属性 250ms 轮询。若该属性在特定系统表现异常，可设 `PCSPEAKER_MAC_MIC_ALWAYS_ACTIVE=1` 强制视为占用——手机常驻采集，隐私兜底仍由手机端静音/强停开关承担。
+
+### 8.5 Mac 上做虚拟摄像头（未实现，需额外立项）
+
+macOS 禁止 DirectShow 式虚拟摄像头；正路是写一个 **CoreMediaIO Camera Extension**（系统扩展：Xcode 工程 + Apple 开发者签名 + 用户手动批准加载），UnityCapture/OBS-for-Mac 均无法被我们的 Rust 进程直接注帧（OBS 的 Mac 虚拟摄像头只能由 OBS 自己喂流）。iPhone→Mac 的摄像头需求可先用系统自带"连续互通相机"。
+
+### 8.6 iPhone + Windows（零移植成本，推荐先测）
+
+手机跑 iPhone 客户端、电脑继续用本 Windows 服务器：**协议完全一致，服务器一行不改**。限制两条：相机必须停留在取景页亮屏（iOS 禁止后台采集）；USB 有线不可用（无 adb），请走 WiFi。

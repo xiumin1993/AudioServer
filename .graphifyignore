@@ -1,0 +1,6 @@
+# graphify 专用排除（gitignore 语法，只能额外排除、不能反排除）
+# vendored 的 UnityCapture 源码不是本项目自研代码，排除后图谱聚焦在 src/
+third_party/
+target/
+dist/
+graphify-out-src/

@@ -28,3 +28,7 @@ ui-design*.html
 
 # 第三方源码压缩包（解压目录 third_party/UnityCapture-master 已提交）
 third_party/*.zip
+
+# graphify 知识图谱产物（本地生成物，可由 graphify extract 重新生成，不入库）
+/graphify-out/
+/graphify-out-src/

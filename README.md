@@ -67,6 +67,14 @@ audioserver.exe --port 8080 --sample-rate 48000 --channels 2 --buffer-size 1024
 > 注：上面这组参数只有命令行版 `server.exe` 认（`server.exe --port 8080 ...`）；
 > GUI 版的端口/采样率在窗口 Settings 页里改，启动时不解析命令行参数。
 
+**日志与窗口（v3.7）**：`audioserver.exe` 编译为 Windows 的 GUI 子系统程序，**启动后只有一个
+egui 窗口，不会再附带那个刷日志的黑色控制台**（以前双击 exe 会同时弹出控制台，正式包里也一样）。
+日志一条不少，有三个地方能看：① 窗口里的**日志**页；② exe 同目录的 `audioserver.log`
+（追加写，完整 INFO 级别）；③ 想要实时滚动的控制台，启动前设环境变量
+`PCSPEAKER_CONSOLE=1`（自己开一个控制台）或 `PCSPEAKER_CONSOLE=attach`（从 cmd/PowerShell
+里启动时接回当前终端）。命令行版 `server.exe` 本来就是控制台程序，日志照常打在终端上。
+后台线程万一 panic 也会被写进 `audioserver.log`（`[Panic] ...`），不会出现"程序悄悄少了一条线"。
+
 **启动自检门禁（v3.5）**：GUI 与 CLI 启动时都会先做一次**只读**检测——
 VB-CABLE（查声卡列表里的 `CABLE Input/Output`）+ Unity Capture / OBS Virtual Camera
 任一（查两个滤镜的 CLSID 是否注册）。必需项齐全才进主界面并起服务端；
@@ -112,6 +120,8 @@ adb reverse tcp:8080 tcp:8080
 | 画面 180° 颠倒 | 旧版本 bug，v3.4.2 起已修（Unity 共享内存为 bottom-up 行序，服务器已翻转） |
 | 声音卡顿 | 2.4GHz WiFi 干扰 → 换 5GHz 或 USB；任务管理器看 CPU 是否被杀毒软件扫描占满 |
 | 手机息屏后掉线 | 手机端开启"麦克风守护/摄像头守护"（前台服务常驻通知保活）；另外关闭系统对 App 的电池优化 |
+| 双击 exe 只有一个窗口，看不到日志在滚 | 正常：v3.7 起 GUI 版不再附带控制台黑窗口（§4「日志与窗口」）。看界面**日志**页或 `audioserver.log`；要控制台就 `PCSPEAKER_CONSOLE=1` 再启动，或直接用命令行版 `server.exe` |
+| 任务管理器里 audioserver 占十几个 CPU 点 | v3.7 前的 bug（WASAPI 回环取到空缓冲区时满核自旋），已修：空闲约 0.4%、满速推流约 0.4%（8 逻辑核口径） |
 
 ## 7. 项目结构
 

@@ -56,6 +56,8 @@ windows = { version = "0.58", features = [
     "Win32_System_Registry",
     # i18n：读系统显示语言（GetUserDefaultUILanguage），决定界面默认中/英
     "Win32_Globalization",
+    # GUI exe 默认无控制台窗口；PCSPEAKER_CONSOLE=1 时用 AllocConsole/AttachConsole 开回来
+    "Win32_System_Console",
 ] }
 
 # ===== macOS 专属依赖（v3.5 Mac 移植）=====

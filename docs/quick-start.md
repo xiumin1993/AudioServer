@@ -9,7 +9,7 @@
 |---|---|
 | `audioserver.exe` | 主程序（egui 图形界面），双击即用 |
 | `server.exe` | 无界面命令行版，功能相同。只在"开机自启 / 挂成计划任务"时才需要它 |
-| `start-audioserver.bat` | 在当前目录窗口启动主程序（日志会同时写到同目录 `audioserver.log`） |
+| `start-audioserver.bat` | 启动主程序（主程序自己不再附带控制台黑窗口，日志写到同目录 `audioserver.log`） |
 | `VERSION.txt` | 本次打包对应的代码提交与编译时间 |
 | `README.md` | 完整文档（协议、架构、常见问题、macOS 移植说明） |
 
@@ -76,6 +76,11 @@
 
 程序同目录的 `audioserver.log` 记录了完整流程（哪个 IP 连上、会话登记、驱动挂载、第一帧上传、
 2 秒一次的吞吐统计）。排查时把它发给对方即可。
+
+界面上也有一个**日志**页，内容与 `audioserver.log` 同步，不用开文件。
+主程序 `audioserver.exe` 不再附带控制台窗口（v3.7 起编译为 GUI 子系统程序）；
+确实需要一行行滚动的控制台时，用 `PCSPEAKER_CONSOLE=1` 启动它，
+或者直接用命令行版 `server.exe`（它本来就是控制台程序）。
 
 ## 8. 界面语言
 

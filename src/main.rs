@@ -1,3 +1,16 @@
+// ── 不弹那个黑色控制台窗口 ──────────────────────────────────────────────────
+// Rust 的 bin 默认编译成 Windows 的"控制台子系统"（PE 头 SUBSYSTEM=Console），
+// 于是双击 exe 时系统会额外分配一个黑色控制台，把 stderr 的日志刷在上面。
+// eframe 只画它自己的窗口，不会替我们隐藏控制台 —— 这就是那个黑窗口的来历，
+// 它不是调试版才有的东西，正式包同样会弹。
+//
+// 声明成 windows 子系统后进程一开始就没有控制台。日志一条都不少：
+//   · 完整落在 exe 同目录的 audioserver.log（DualLogger 本来就在写文件）；
+//   · 窗口里的"日志"页照常看。
+// 想要实时滚动输出：PCSPEAKER_CONSOLE=1 启动（自己开一个控制台），
+// 或 PCSPEAKER_CONSOLE=attach（从 cmd/PowerShell 里启动时挂到父控制台）。
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use eframe::egui;
 use log::{LevelFilter, Log, Metadata, Record};
 use std::cell::RefCell;
@@ -83,6 +96,47 @@ fn init_logger() {
     log::set_max_level(level);
 }
 
+/// 只有在用户明确要求时才创建控制台（配合文件头的 `windows_subsystem = "windows"`）。
+/// 必须在 init_logger 之前调用：Rust 的标准输出句柄是"第一次用到时才缓存"，
+/// 先建控制台、后写日志，stderr 才会指向新控制台；反过来就永远是个空句柄。
+#[cfg(windows)]
+fn maybe_attach_console() {
+    let Ok(mode) = std::env::var("PCSPEAKER_CONSOLE") else {
+        return;
+    };
+    use windows::Win32::System::Console::{
+        AllocConsole, AttachConsole, ATTACH_PARENT_PROCESS,
+    };
+    unsafe {
+        if mode.eq_ignore_ascii_case("attach") {
+            // 从 cmd / PowerShell 里启动：接回调用方的控制台，日志跟着终端走
+            let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+        } else {
+            // 双击启动：单独开一个控制台窗口
+            let _ = AllocConsole();
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn maybe_attach_console() {}
+
+/// 把 panic 写进日志。没有控制台窗口之后这一步是必需的：
+/// 后台线程（采集/注入/推流）万一 panic，程序不会崩给你看，只是那条线悄悄断了，
+/// 现场什么痕迹都没有 —— 现在它会进 audioserver.log，界面的"日志"页也能看到。
+fn install_panic_logger() {
+    // 防递归：万一 panic 发生在日志本身的处理里，钩子里再调 log::error! 会无限套娃
+    static IN_HOOK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    std::panic::set_hook(Box::new(|info| {
+        if IN_HOOK.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        log::error!("[Panic] {info}");
+        eprintln!("[Panic] {info}");
+        IN_HOOK.store(false, std::sync::atomic::Ordering::Relaxed);
+    }));
+}
+
 // ── v2 浅色主题配色 ──
 mod colors {
     use eframe::egui::Color32;
@@ -118,7 +172,9 @@ mod colors {
 }
 
 fn main() -> eframe::Result<()> {
+    maybe_attach_console();
     init_logger();
+    install_panic_logger();
     log::info!("[Main] AudioServer starting (dual logger: stderr + audioserver.log)");
 
     // i18n：先决定界面语言，再画任何一帧。
@@ -137,7 +193,7 @@ fn main() -> eframe::Result<()> {
     // 英文 420px 宽够用，但中文标题更短、按钮更长，宽度先不随语言变（下一版再看）
     let window_title = lang::t("app.title");
 
-    eframe::run_native(
+    let result = eframe::run_native(
         &window_title,
         options,
         Box::new(|cc| {
@@ -176,7 +232,13 @@ fn main() -> eframe::Result<()> {
             }
             Ok(Box::new(app))
         }),
-    )
+    );
+    if let Err(e) = &result {
+        // 黑窗口没了，"双击没反应"这种失败必须自己留痕：
+        // 起不来通常是显卡/驱动或窗口系统的问题，日志里要能看到原因。
+        log::error!("[Main] GUI failed to start: {e:?}");
+    }
+    result
 }
 
 // ── 中文字体兜底（v3.5）──

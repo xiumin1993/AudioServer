@@ -326,10 +326,12 @@ mod windows_impl {
         let path = wstr(CONSENT_PATH);
         let mut h = HKEY(std::ptr::null_mut());
         if !RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(path.as_ptr()), 0, KEY_READ, &mut h).is_ok() {
+            info!("[VcamObs] Failed to open webcam consent registry key");
             return false;
         }
         let hit = scan_subkeys(h, 2);
         let _ = RegCloseKey(h);
+        info!("[VcamObs] webcam_access_active() = {}", hit);
         hit
     }
 
@@ -359,8 +361,8 @@ mod windows_impl {
                 if now_active != active {
                     active = now_active;
                     info!(
-                        "[VcamObs] Camera {}",
-                        if active { "is being watched (via OBS vcam)" } else { "released" }
+                        "[VcamObs] Camera {} (via OBS vcam registry poll)",
+                        if active { "is being watched" } else { "released" }
                     );
                     tx.send(active).ok();
                 }

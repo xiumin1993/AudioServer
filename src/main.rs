@@ -223,6 +223,19 @@ mod colors {
     // Toggle
     pub const TOGGLE_ON: Color32 = Color32::from_rgb(34, 197, 94);
     pub const TOGGLE_OFF: Color32 = Color32::from_rgb(221, 221, 221);
+
+    // ── 输入控件（文本框 / 下拉框）──
+    // 为什么单独一组：卡片是纯白的，而 egui 默认给输入框的底色是 extreme_bg_color
+    // （浅色主题里几乎是白），边框又走 noninteractive/inactive 那套淡灰 ——
+    // 结果就是"输入框和背景糊成一片，看不出哪里能改"（2026-10-01 用户反馈原话）。
+    // 所以底色要压到肉眼可辨的浅灰蓝，边框给到 slate-400 这个强度。
+    pub const INPUT_BG: Color32 = Color32::from_rgb(241, 245, 249);
+    pub const INPUT_BG_HOVER: Color32 = Color32::from_rgb(226, 232, 240);
+    pub const INPUT_BORDER: Color32 = Color32::from_rgb(148, 163, 184);
+    pub const INPUT_BORDER_HOVER: Color32 = Color32::from_rgb(100, 116, 139);
+    /// 服务运行中字段是禁用的：不能像 egui 默认那样淡到看不见，
+    /// 用户得能读出"现在生效的是哪个值"，只是改不动。
+    pub const INPUT_BG_DISABLED: Color32 = Color32::from_rgb(243, 244, 246);
 }
 
 fn main() -> eframe::Result<()> {
@@ -283,6 +296,28 @@ fn main() -> eframe::Result<()> {
             visuals.selection.bg_fill =
                 egui::Color32::from_rgba_premultiplied(37, 99, 235, 30);
             visuals.selection.stroke = egui::Stroke::new(1.0_f32, colors::ACCENT);
+
+            // ── 输入控件的可见性（v3.8.1）──
+            // TextEdit 的底色只认 extreme_bg_color（egui 写死的，见 widgets/text_edit/builder.rs），
+            // 边框认"当前交互状态"的 bg_stroke；所以这两处一改，所有文本框一起变。
+            // 下拉框（ComboBox）不一样：它用 weak_bg_fill，而那一项同时也是弹出菜单
+            // 每一行的底色 —— 在这里全局改会把整个菜单染成一片灰。所以下拉框的底色
+            // 由 config_dropdown 在自己的小范围 style 里改（见 Ui::scope 那段注释）。
+            visuals.extreme_bg_color = colors::INPUT_BG;
+            visuals.widgets.inactive.bg_stroke =
+                egui::Stroke::new(1.0_f32, colors::INPUT_BORDER);
+            visuals.widgets.hovered.bg_stroke =
+                egui::Stroke::new(1.0_f32, colors::INPUT_BORDER_HOVER);
+            // 悬停/菜单行的高亮底色：weak_bg_fill 是"可选底色"，下拉框和弹出菜单的每一行
+            // 都读它。给一档比白卡片深的浅灰，鼠标划过才看得见"是哪一行"。
+            visuals.widgets.hovered.weak_bg_fill = colors::INPUT_BG_HOVER;
+            visuals.widgets.active.bg_stroke = egui::Stroke::new(1.5_f32, colors::ACCENT);
+            // 禁用态走的是 noninteractive（add_enabled_ui(false) 会改变 sense），
+            // 边框留一条可辨的浅灰，别让它消失成纯文本。
+            visuals.widgets.noninteractive.bg_stroke =
+                egui::Stroke::new(1.0_f32, colors::BORDER);
+            // 聚焦描边：文本框获得焦点时 egui 用 selection.stroke 画框，加粗一点才看得出"我在改哪一格"
+            visuals.selection.stroke = egui::Stroke::new(1.5_f32, colors::ACCENT);
             cc.egui_ctx.set_visuals(visuals);
 
             let app = AudioServerApp::new();
@@ -741,11 +776,30 @@ impl AudioServerApp {
         key: &'static str,
         dirty: &mut Vec<(&'static str, bool)>,
     ) {
-        let resp = ui.add(
-            egui::TextEdit::singleline(value)
-                .desired_width(80.0)
-                .horizontal_align(egui::Align::RIGHT),
-        );
+        let edit = egui::TextEdit::singleline(value)
+            .desired_width(88.0)
+            // 内边距：数字贴着边框会显得"不像个框"，留 6x4 才像输入控件
+            .margin(egui::Margin::symmetric(6.0, 4.0))
+            .horizontal_align(egui::Align::RIGHT);
+        // 为什么两种状态都要包一层 Ui::scope（看着很多余，其实是被坑出来的）：
+        // TextEdit 的边框/底色不是一起画的 —— show() 先往 painter 里塞一个 Shape::Noop 占位，
+        // 画完内容再 ui.painter().set(那个下标, 矩形) 把背景填回去。
+        // 而 egui::Grid 会重排/搬移单元格里的 shape 列表，占位下标就失效了：
+        // 结果【直接 add 的输入框永远不画框】，只剩一串数字贴在白卡片上（2026-10-01 实测：
+        // 停止服务后 48000/2/1024 三行像素级纯白，一个框都没有；运行中走了 scope 反而有框）。
+        // 包一层 scope 之后，占位下标落在子 ui 自己的列表里，父级怎么搬都不影响它。
+        let resp = ui
+            .scope(|ui| {
+                // 文本框底色只认 extreme_bg_color（不随交互状态变），所以禁用态在这里换一档：
+                // 底色压深 + 下面 noninteractive 的浅边框，一眼能看出"这是当前值，但现在改不动"。
+                ui.visuals_mut().extreme_bg_color = if ui.is_enabled() {
+                    colors::INPUT_BG
+                } else {
+                    colors::INPUT_BG_DISABLED
+                };
+                ui.add(edit)
+            })
+            .response;
         // changed() 只在"这一帧里文本真的变了"时为真。
         // 为什么不用"整个界面还有没有焦点"来判断改完没有：按 Tab 时焦点会跳到
         // 下一个控件（还是 is_some），那样就永远不落盘了。所以问这个框自己。

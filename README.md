@@ -181,3 +181,37 @@ macOS 禁止 DirectShow 式虚拟摄像头；正路是写一个 **CoreMediaIO Ca
 ### 8.6 iPhone + Windows（零移植成本，推荐先测）
 
 手机跑 iPhone 客户端、电脑继续用本 Windows 服务器：**协议完全一致，服务器一行不改**。限制两条：相机必须停留在取景页亮屏（iOS 禁止后台采集）；USB 有线不可用（无 adb），请走 WiFi。
+
+---
+
+## 9. 界面语言（国际化，v3.7）
+
+服务端 GUI（含缺驱动时的环境向导页）全部中英双语，方案是 **rust-i18n**（编译期把
+`locales/*.toml` 嵌进二进制，所以发行包仍然是绿色单 exe，不带语言文件）。
+
+**默认跟随系统**：启动时读 Windows 的"显示语言"（`GetUserDefaultUILanguage()`），
+中文系统进中文，其余一律英文（本版只有两套文案，落到英文至少可读）。
+
+改语言的三个入口，优先级从高到低：
+
+| 方式 | 怎么做 | 用途 |
+|------|--------|------|
+| 环境变量 | `set PCSPEAKER_LANG=zh`（或 `en`）后再启动 | 排错/截图验证，临时覆盖不留痕 |
+| 设置文件 | exe 同目录 `settings.txt` 写 `language=auto\|en\|zh` | 用户手动指定；GUI 里 LANGUAGE 卡片选档会自动写这里 |
+| 系统语言 | 不用管 | 默认（`auto`） |
+
+> `settings.txt` 与 `audioserver.log` 一样放在 exe 同目录：**不写注册表、不碰 AppData**，
+> 删掉文件即恢复默认（绿色单文件的承诺不变）。
+
+其他约定：
+
+- **运行日志保持英文**（`audioserver.log`）：日志主要给排错和 grep 用，不随界面语言变。
+- **通用缩写不翻译**：WiFi / USB / IP / WebSocket / PCM / Hz / kbps / fps / ms / kB 两边写法
+  一致；品牌名 "PC Assistant / AudioServer" 不译；语言名用母语写法（"简体中文"永远写作
+  "简体中文"），这是全球软件的通行惯例。
+- 中文界面依赖系统中文字体兜底（`C:\Windows\Fonts\simhei.ttf` 等，启动时自动挂载）。
+  极少数纯英文系统没有中文字体时，中文会显示成方框 —— 切回 English 即可，日志里有
+  `no usable CJK font found` 一行说明。
+- 加第三种语言：新增 `locales/ja.toml`（键必须与 en 完全一致，`cargo test --lib lang::`
+  会检查），在 `src/lang.rs` 的 `primary_language_of_system()` 补一个 LANGID 分支，
+  再把 GUI 的语言卡片加一档。

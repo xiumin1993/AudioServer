@@ -44,9 +44,19 @@ $zip      = Join-Path $root "dist\$pkgName.zip"
 Write-Host "==> packaging $pkgName (commit $commit, built $builtAt)"
 
 # ---- 3. stage the tree ------------------------------------------------------
-# 注意：包里【不附带任何驱动或驱动安装脚本】。缺驱动时程序启动自检会给文字提示，
-# 用户自己去官网下载。这样包更小，也不会碰用户系统。
-if (Test-Path $stage) { Remove-Item $stage -Recurse -Force -ErrorAction Continue }
+# NO driver files and NO driver-install scripts go into the package (by design):
+# the exe only detects + tells the user where to download them. Keeps the package
+# small and means the program never touches the user's system.
+# ASCII comments only: PS 5.1 decodes this file as ANSI, and a Chinese comment
+# ending in a dangling lead byte swallows the newline and comments out the next line.
+if (Test-Path $stage) {
+    # The just-copied exes are often still being scanned (Defender) or held by an open
+    # Explorer window, so one Remove-Item attempt can fail transiently: retry a few times.
+    for ($i = 0; $i -lt 5 -and (Test-Path $stage); $i++) {
+        Remove-Item $stage -Recurse -Force -ErrorAction Continue
+        Start-Sleep -Milliseconds 600
+    }
+}
 if (Test-Path $stage) {
     # A leftover dir would silently mix the previous build's files into this package
     # (that is exactly how an old drivers\ folder once survived into a "clean" tree).
@@ -98,8 +108,10 @@ if ($forbidden) {
 }
 Write-Host ("==> staged tree ok (" + $must.Count + " required entries, no driver payload)")
 
-if (Test-Path $zip) { Remove-Item $zip -Force }
-Compress-Archive -Path $stage -DestinationPath $zip -CompressionLevel Optimal
+if (Test-Path $zip) { Remove-Item $zip -Force -ErrorAction Continue }
+# -Force: overwrite a zip the previous delete could not release (Defender scan)
+Compress-Archive -Path $stage -DestinationPath $zip -CompressionLevel Optimal -Force
+# The staged folder is deliberately kept next to the zip so it can be browsed/inspected.
 
 Write-Host '==> result'
 Get-ChildItem $zip | ForEach-Object {

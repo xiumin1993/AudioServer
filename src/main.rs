@@ -21,6 +21,7 @@ use std::sync::OnceLock;
 use std::time::Instant;
 use tokio::sync::mpsc as tokio_mpsc;
 
+use audioserver::config;
 use audioserver::env_check::{self, EnvGuide, GuideAction};
 use audioserver::lang;
 use audioserver::server::{run_server, ServerCommand, ServerConfig, ServerEvent, ServerStatus};
@@ -84,9 +85,12 @@ impl Log for DualLogger {
 }
 
 fn init_logger() {
+    // 级别优先级：RUST_LOG（临时排障，改起来最快）> config.json 的 diagnostics.log_level
+    // > info。RUST_LOG 认不认得出由 std::str::FromStr 决定，认不出就往下走配置。
     let level = std::env::var("RUST_LOG")
         .ok()
         .and_then(|s| s.parse().ok())
+        .or_else(|| config::get().diagnostics.log_level.parse().ok())
         .unwrap_or(LevelFilter::Info);
     let logger = Box::new(DualLogger {
         level,
@@ -96,30 +100,50 @@ fn init_logger() {
     log::set_max_level(level);
 }
 
-/// 只有在用户明确要求时才创建控制台（配合文件头的 `windows_subsystem = "windows"`）。
+/// 把"配置从哪来、有没有新建、有没有被夹紧"写进日志。
+/// 这三件事必须留痕：用户报"我改了没生效"时，第一句要问的就是他改的是哪份文件。
+fn log_config(loaded: &config::Loaded) {
+    match &loaded.path {
+        Some(p) if loaded.created => log::info!("[Config] created default config: {}", p.display()),
+        Some(p) => log::info!("[Config] loaded {}", p.display()),
+        None => log::warn!("[Config] no config dir (APPDATA missing) —— running on built-in defaults"),
+    }
+    if let Some(e) = &loaded.error {
+        // 文件在但读不动/解析失败：按默认值跑，同时把原因摊开，
+        // 不然用户只会觉得"程序把我的配置吞了"
+        log::error!("[Config] invalid config file, fell back to defaults: {e}");
+    }
+    for w in &loaded.warnings {
+        log::warn!("[Config] {w}");
+    }
+}
+
+/// 只有在用户明确要求时才创建控制台：环境变量 PCSPEAKER_CONSOLE 或
+/// config.json 的 diagnostics.show_console（配合文件头的 `windows_subsystem = "windows"`）。
 /// 必须在 init_logger 之前调用：Rust 的标准输出句柄是"第一次用到时才缓存"，
 /// 先建控制台、后写日志，stderr 才会指向新控制台；反过来就永远是个空句柄。
 #[cfg(windows)]
-fn maybe_attach_console() {
-    let Ok(mode) = std::env::var("PCSPEAKER_CONSOLE") else {
+fn maybe_attach_console(config_wants_console: bool) {
+    let mode = std::env::var("PCSPEAKER_CONSOLE").ok();
+    if mode.is_none() && !config_wants_console {
         return;
-    };
+    }
     use windows::Win32::System::Console::{
         AllocConsole, AttachConsole, ATTACH_PARENT_PROCESS,
     };
     unsafe {
-        if mode.eq_ignore_ascii_case("attach") {
-            // 从 cmd / PowerShell 里启动：接回调用方的控制台，日志跟着终端走
+        // attach = 从 cmd/PowerShell 启动时接回调用方的控制台；
+        // 其它任何值（含"只有配置要求开"的情况）= 自己开一个新控制台窗口
+        if mode.is_some_and(|m| m.eq_ignore_ascii_case("attach")) {
             let _ = AttachConsole(ATTACH_PARENT_PROCESS);
         } else {
-            // 双击启动：单独开一个控制台窗口
             let _ = AllocConsole();
         }
     }
 }
 
 #[cfg(not(windows))]
-fn maybe_attach_console() {}
+fn maybe_attach_console(_config_wants_console: bool) {}
 
 /// 把 panic 写进日志。没有控制台窗口之后这一步是必需的：
 /// 后台线程（采集/注入/推流）万一 panic，程序不会崩给你看，只是那条线悄悄断了，
@@ -172,10 +196,14 @@ mod colors {
 }
 
 fn main() -> eframe::Result<()> {
-    maybe_attach_console();
+    // 顺序不能乱：配置要第一个读，因为"要不要开控制台"和"日志级别"都由它决定，
+    // 而这两个东西一旦开始输出日志就再也改不回来了。
+    let loaded = config::init();
+    maybe_attach_console(loaded.config.diagnostics.show_console);
     init_logger();
     install_panic_logger();
     log::info!("[Main] AudioServer starting (dual logger: stderr + audioserver.log)");
+    log_config(&loaded);
 
     // i18n：先决定界面语言，再画任何一帧。
     // 优先级 = PCSPEAKER_LANG 环境变量 > exe 同目录 settings.txt > 系统显示语言。
@@ -404,17 +432,30 @@ struct AudioServerApp {
     /// Some = 必需驱动缺失，主窗口整页只显示向导，服务端线程不起
     env_gate: Option<EnvGuide>,
     // ── v3.6 国际化 ──
-    /// 上一次切换语言时 settings.txt 写入失败的原文（界面显示，成功则清空）
+    /// 上一次切换语言时保存失败的原文（界面显示，成功则清空）
     lang_error: Option<String>,
+    // ── v3.8 配置文件 ──
+    /// 配置文件路径的显示文本（在 new() 里算一次）。
+    /// 为什么不每帧现取：设置页每帧都要画这一行，历史事故是"每帧读一次文件 + 打一行日志"
+    /// 把 audioserver.log 灌了三万多次；这里连字符串拼接都提前做掉。
+    config_path_text: Option<String>,
+    /// 设置页里"改过但还没落盘"的输入框（等到输入框失去焦点那一下才写 config.json，
+    /// 见 persist_settings）。(字段名, 这一项是否已改完)：字段名进日志，
+    /// "改完"决定落盘时机。
+    settings_dirty: Vec<(&'static str, bool)>,
 }
 
 impl AudioServerApp {
     fn new() -> Self {
+        // 界面上那几个输入框的初值来自 config.json（不是硬编码），
+        // 这样"改配置文件 → 看界面 → 点开关"三处看到的永远是同一个数。
+        // config::get() 只是读内存里那份全局配置（main 开头已经 init 过），不碰磁盘。
+        let cfg = config::get();
         let mut app = Self {
-            port: "8080".to_string(),
-            sample_rate: "48000".to_string(),
-            channels: "2".to_string(),
-            buffer_size: "1024".to_string(),
+            port: cfg.network.port.to_string(),
+            sample_rate: cfg.speaker.sample_rate.to_string(),
+            channels: cfg.speaker.channels.to_string(),
+            buffer_size: cfg.speaker.buffer_frames.to_string(),
             connection_type: ConnectionType::Wifi,
             server_status: ServerStatus::Stopped,
             server_handle: None,
@@ -433,7 +474,7 @@ impl AudioServerApp {
             mic_source: None,
             mic_bars: [0.0; 34],
             mic_stats: None,
-            pause_speaker_live: false,
+            pause_speaker_live: cfg.speaker.pause_while_mic_live,
             cam_live: false,
             cam_session: false,
             cam_source: None,
@@ -442,15 +483,20 @@ impl AudioServerApp {
             cam_texture: None,
             env_gate: None,
             lang_error: None,
+            config_path_text: config::config_path().map(|p| p.display().to_string()),
+            settings_dirty: Vec::new(),
         };
         // v3.5：启动先做一次【只读】环境自检（不写注册表、不装任何东西）。
         //   · 必需驱动齐 → 和以前一样，自动开启服务端
         //   · 缺驱动     → 不起服务端线程，主窗口只显示"环境准备"向导页，
         //                  用户装完点【重新检测】才会真正进入主界面
-        // 开发调试（Mac 移植期 / 想在缺驱动的机器上看 UI）可用环境变量跳过：
-        //   set PCSPEAKER_SKIP_ENV_CHECK=1
+        // 开发调试（Mac 移植期 / 想在缺驱动的机器上看 UI）可跳过：
+        //   环境变量 PCSPEAKER_SKIP_ENV_CHECK=1，或 config.json 里
+        //   diagnostics.skip_env_check = true。两条路都留着：环境变量适合临时/脚本，
+        //   配置项适合"这台机器我就想常开着看界面"。
         let report = env_check::detect();
-        let skip_gate = std::env::var("PCSPEAKER_SKIP_ENV_CHECK").is_ok();
+        let skip_gate = std::env::var("PCSPEAKER_SKIP_ENV_CHECK").is_ok()
+            || config::get().diagnostics.skip_env_check;
         // 开发/演示用：PCSPEAKER_FORCE_ENV_GUIDE=1 时，第一帧就停在向导页，
         // 并且把检测结果换成"什么都没装"的样例，这样不用找一台干净电脑，
         // 也能看到缺项 + 下载按钮的完整形态（点【重新检测】会按真实结果判定，
@@ -463,7 +509,7 @@ impl AudioServerApp {
         };
         if (report.ready() || skip_gate) && !force_guide {
             if skip_gate && !report.ready() {
-                log::warn!("[Main] PCSPEAKER_SKIP_ENV_CHECK set —— 环境未齐，仍强行进入主界面");
+                log::warn!("[Main] 跳过环境门禁（PCSPEAKER_SKIP_ENV_CHECK 或 diagnostics.skip_env_check）—— 环境未齐，仍强行进入主界面");
             }
             app.start_server();
         } else {
@@ -643,6 +689,115 @@ impl AudioServerApp {
     fn sync_speaker_pause(&self) {
         let pause = self.mode == AppMode::Mic && self.pause_speaker_live;
         self.send_cmd(ServerCommand::SetSpeakerPaused(pause));
+    }
+
+    // ── v3.8：设置页 ↔ config.json ─────────────────────────────────────────
+    // 为什么自动写盘、界面上不放【保存】按钮：安装版的原则是"配置文件说了算，
+    // 界面上改了不丢"。加按钮就要多一套文案、多一种"改了但没保存"的困惑状态。
+    // 什么时候落盘：输入框【失去焦点】或按回车的那一下（见 flush_settings_if_ready），
+    // 不是每敲一个字符写一次盘 —— 那是每按一键一次磁盘 IO + 一次整份序列化。
+    // 落到哪：%APPDATA%\PCAssistant\config.json（见 config.rs 顶部说明）。
+
+    /// 画一个"接到配置上的输入框"。改过的字段先记进 `dirty`，
+    /// 真正写文件的时机由 flush_settings_if_ready 统一判断。
+    /// dirty 里那个 bool = "这一项已经改完了"（失去焦点或按了回车），
+    /// 只要有一项改完，就把这一批一起落盘。
+    fn config_text_edit(
+        ui: &mut egui::Ui,
+        value: &mut String,
+        key: &'static str,
+        dirty: &mut Vec<(&'static str, bool)>,
+    ) {
+        let resp = ui.add(
+            egui::TextEdit::singleline(value)
+                .desired_width(80.0)
+                .horizontal_align(egui::Align::RIGHT),
+        );
+        // changed() 只在"这一帧里文本真的变了"时为真。
+        // 为什么不用"整个界面还有没有焦点"来判断改完没有：按 Tab 时焦点会跳到
+        // 下一个控件（还是 is_some），那样就永远不落盘了。所以问这个框自己。
+        let finished = resp.lost_focus()
+            || (resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+        if resp.changed() || finished {
+            match dirty.iter_mut().find(|(k, _)| *k == key) {
+                Some(entry) => entry.1 |= finished,
+                None => dirty.push((key, finished)),
+            }
+        }
+    }
+
+    /// 攒着的改动什么时候写盘：有任意一项"改完了"（焦点离开该框 / 在该框里按了回车）。
+    fn flush_settings_if_ready(&mut self) {
+        if !self.settings_dirty.iter().any(|(_, done)| *done) {
+            return;
+        }
+        let entries = std::mem::take(&mut self.settings_dirty);
+        let keys: Vec<&'static str> = entries.into_iter().map(|(k, _)| k).collect();
+        self.persist_settings(&keys);
+    }
+
+    /// 把界面上的音频/网络参数 + "麦忙时暂停外放"写回 config.json。
+    /// 数字解析不出来（打字打到一半、误填了字母）时保留文件里的旧值，
+    /// 界面上那串字符也原样留着让用户改完 —— 绝不静默把用户输入清零。
+    fn persist_settings(&mut self, keys: &[&'static str]) {
+        let mut cfg = config::get();
+        let mut rejected: Vec<&str> = Vec::new();
+
+        for key in keys {
+            match *key {
+                "network.port" => match self.port.trim().parse::<u16>() {
+                    Ok(v) => cfg.network.port = v,
+                    Err(_) => rejected.push(key),
+                },
+                "speaker.sample_rate" => match self.sample_rate.trim().parse::<u32>() {
+                    Ok(v) => cfg.speaker.sample_rate = v,
+                    Err(_) => rejected.push(key),
+                },
+                "speaker.channels" => match self.channels.trim().parse::<u16>() {
+                    Ok(v) => cfg.speaker.channels = v,
+                    Err(_) => rejected.push(key),
+                },
+                "speaker.buffer_frames" => match self.buffer_size.trim().parse::<u32>() {
+                    Ok(v) => cfg.speaker.buffer_frames = v,
+                    Err(_) => rejected.push(key),
+                },
+                "speaker.pause_while_mic_live" => {
+                    cfg.speaker.pause_while_mic_live = self.pause_speaker_live
+                }
+                other => log::warn!("[Config] unknown settings key {other}"),
+            }
+        }
+
+        match config::update(cfg) {
+            Ok(()) => {
+                // 写完以文件里的值为准刷新界面：update() 内部会夹紧越界取值
+                // （端口 0、声道 5、缓冲区 100 万帧…），刷新后用户看到的就是他
+                // 实际得到的那个数，而不是他刚打进去的那串。
+                let saved = config::get();
+                self.port = saved.network.port.to_string();
+                self.sample_rate = saved.speaker.sample_rate.to_string();
+                self.channels = saved.speaker.channels.to_string();
+                self.buffer_size = saved.speaker.buffer_frames.to_string();
+                self.pause_speaker_live = saved.speaker.pause_while_mic_live;
+                if !rejected.is_empty() {
+                    self.add_log(format!(
+                        "[Config] kept previous value for {} (not a number yet)",
+                        rejected.join(", ")
+                    ));
+                }
+                log::info!("[Config] saved {} field(s)", keys.len());
+                if let Some(p) = config::config_path() {
+                    self.add_log(format!("[Config] saved to {}", p.display()));
+                } else {
+                    self.add_log("[Config] saved (config dir unavailable)".to_string());
+                }
+            }
+            Err(e) => {
+                // 写不进去（磁盘只读、目录被删…）必须说清楚，否则用户以为改了
+                log::warn!("[Config] save failed: {e}");
+                self.add_log(format!("[Config] save failed: {e}"));
+            }
+        }
     }
 
     fn add_log(&mut self, msg: String) {
@@ -1379,6 +1534,9 @@ impl AudioServerApp {
             {
                 self.pause_speaker_live = !self.pause_speaker_live;
                 self.sync_speaker_pause();
+                // 麦克风主页上这个快捷开关和【设置】页的复选框是同一个值，
+                // 点了也要落进 config.json，否则重启就回到老样子
+                self.persist_settings(&["speaker.pause_while_mic_live"]);
             }
         });
 
@@ -1787,10 +1945,11 @@ impl AudioServerApp {
 
     /// v3.6：语言设置卡片 —— 三种模式的【设置】页底部都会挂上它。
     /// ----------------------------------------------------------------------------
-    /// 三个按钮 = settings.txt 里 language 的三种取值：
+    /// 三个按钮 = config.json 里 language 的三种取值：
     ///   auto = 跟随系统（默认） / en = 强制英文 / zh = 强制简体中文
     /// 点下去立刻生效（egui 每帧重新取文案，下一帧整站换语言），
-    /// 同时写进 exe 同目录的 settings.txt —— 不写注册表，文件删掉就回到默认。
+    /// 同时写进 %APPDATA%\PCAssistant\config.json —— 不写注册表；
+    /// v3.8 之前这个选择存在 exe 同目录的 settings.txt，升级时会自动搬过来一次。
     fn show_language_card(&mut self, ui: &mut egui::Ui) {
         let card = egui::Frame::none()
             .fill(colors::BG_WHITE)
@@ -1896,6 +2055,9 @@ impl AudioServerApp {
             self.show_mic_settings_tab(ui);
             ui.add_space(8.0);
             self.show_language_card(ui);
+            ui.add_space(8.0);
+            self.show_config_card(ui);
+            self.flush_settings_if_ready();
             return;
         }
         // v3.4：Camera 模式呈现摄像头设置（设备名提示 + 待命说明）
@@ -1903,6 +2065,9 @@ impl AudioServerApp {
             self.show_camera_settings_tab(ui);
             ui.add_space(8.0);
             self.show_language_card(ui);
+            ui.add_space(8.0);
+            self.show_config_card(ui);
+            self.flush_settings_if_ready();
             return;
         }
         // 运行时锁定提示
@@ -1954,10 +2119,11 @@ impl AudioServerApp {
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.sample_rate)
-                                        .desired_width(80.0)
-                                        .horizontal_align(egui::Align::RIGHT),
+                                Self::config_text_edit(
+                                    ui,
+                                    &mut self.sample_rate,
+                                    "speaker.sample_rate",
+                                    &mut self.settings_dirty,
                                 );
                             },
                         );
@@ -1971,10 +2137,11 @@ impl AudioServerApp {
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.channels)
-                                        .desired_width(80.0)
-                                        .horizontal_align(egui::Align::RIGHT),
+                                Self::config_text_edit(
+                                    ui,
+                                    &mut self.channels,
+                                    "speaker.channels",
+                                    &mut self.settings_dirty,
                                 );
                             },
                         );
@@ -1988,10 +2155,11 @@ impl AudioServerApp {
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.buffer_size)
-                                        .desired_width(80.0)
-                                        .horizontal_align(egui::Align::RIGHT),
+                                Self::config_text_edit(
+                                    ui,
+                                    &mut self.buffer_size,
+                                    "speaker.buffer_frames",
+                                    &mut self.settings_dirty,
                                 );
                             },
                         );
@@ -2029,10 +2197,11 @@ impl AudioServerApp {
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.port)
-                                        .desired_width(80.0)
-                                        .horizontal_align(egui::Align::RIGHT),
+                                Self::config_text_edit(
+                                    ui,
+                                    &mut self.port,
+                                    "network.port",
+                                    &mut self.settings_dirty,
                                 );
                             },
                         );
@@ -2043,6 +2212,42 @@ impl AudioServerApp {
 
         ui.add_space(8.0);
         self.show_language_card(ui);
+        ui.add_space(8.0);
+        self.show_config_card(ui);
+
+        // 本帧结束前统一判断：有输入框"改完了"就写一次 config.json。
+        // 每个提前 return 的分支都要带上这句，否则用户在设置页改一半切走，改动就丢了。
+        self.flush_settings_if_ready();
+    }
+
+    /// v3.8：配置文件卡片 —— 三种模式的【设置】页底部都有。
+    /// 为什么要在界面上把路径写出来：安装版把 exe 放进 Program Files、配置放进
+    /// %APPDATA%，用户（和收 bug 反馈的人）第一个问题永远是"我改的那个文件在哪"。
+    /// 这一行只读内存里已经算好的路径字符串，不碰磁盘、不打日志。
+    fn show_config_card(&self, ui: &mut egui::Ui) {
+        let card = egui::Frame::none()
+            .fill(colors::BG_WHITE)
+            .stroke(egui::Stroke::new(1.0_f32, colors::BORDER))
+            .rounding(8.0)
+            .inner_margin(egui::Margin::same(14.0));
+        card.show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(lang::t("settings.config_file"))
+                    .size(11.0)
+                    .color(colors::TEXT_MUTED),
+            );
+            ui.add_space(6.0);
+            let text = match &self.config_path_text {
+                Some(p) => lang::tf("settings.config_hint", &[("path", p)]),
+                // 拿不到 APPDATA（极端环境）：说清楚本次只按内置默认值跑
+                None => lang::t("settings.config_missing"),
+            };
+            ui.label(
+                egui::RichText::new(text)
+                    .size(11.0)
+                    .color(colors::TEXT_SECONDARY),
+            );
+        });
     }
 
     // ── v3：Mic 模式 Settings Tab ──
@@ -2071,6 +2276,9 @@ impl AudioServerApp {
                     ui.checkbox(&mut self.pause_speaker_live, "");
                     if self.pause_speaker_live != old {
                         self.sync_speaker_pause();
+                        // 开关没有"打到一半"的中间状态：一次点击就是一个完整决定，
+                        // 所以这里立刻落盘，不用走输入框那套 dirty 队列
+                        self.persist_settings(&["speaker.pause_while_mic_live"]);
                     }
                 });
             });
@@ -2304,7 +2512,17 @@ impl eframe::App for AudioServerApp {
                 ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
                 match self.active_tab {
                     AppTab::Connection => self.show_connection_tab(ui),
-                    AppTab::Settings => self.show_settings_tab(ui, is_running),
+                    // v3.8：设置页套一层滚动区。这一页现在最长（音频 / 网络 / 语言 /
+                    // 配置文件四张卡片），420x540 的默认窗口高度装不下，卡片底部会被
+                    // 直接裁掉 —— 用户看不到"配置文件在哪"这句话，等于白加。
+                    // 只套这一页：日志页自己管滚动（show_log_tab 用 available_height
+                    // 算高度），外面再套一层会和它打架。
+                    // auto_shrink([false,false]) = 横竖都占满剩余空间，保持原来的整宽卡片样式。
+                    AppTab::Settings => {
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| self.show_settings_tab(ui, is_running));
+                    }
                     AppTab::Log => self.show_log_tab(ui),
                 }
             });

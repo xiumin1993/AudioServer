@@ -35,6 +35,11 @@ local-ip-address = "0.6"
 clap = { version = "4.5", features = ["derive"] }
 rust-i18n = "4.2.4"
 
+# 配置文件 config.json（v3.8）：serde 负责结构体 <-> JSON，
+# 默认值全部写在 Rust 的 Default 实现里，所以不需要 toml/serde 的 derive 之外的东西。
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
 # ===== 以下是真正的 Windows 专属依赖（TOML 分节规则：表格标题到下一个标题为止）=====
 # v3.5 修复：以前这些跨平台依赖误写在本节内部，导致 Mac 目标 cargo check 全部找不到 crate
 [target.'cfg(windows)'.dependencies]

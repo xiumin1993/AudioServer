@@ -125,8 +125,11 @@ language = "LANGUAGE"
 lang_auto = "Follow system"
 lang_en = "English"
 lang_zh = "简体中文"
-lang_hint = "System language detected: {locale}. Your choice is saved to settings.txt next to the exe."
-lang_save_failed = "Could not save settings.txt ({error}) — the switch still works until you restart."
+lang_hint = "System language detected: {locale}. Your choice is saved to the config file (config.json)."
+lang_save_failed = "Could not save the config file ({error}) — the switch still works until you restart."
+config_file = "CONFIG FILE"
+config_hint = "Every setting above is saved automatically to:\n{path}\nRestart the program so audio/hardware values take effect. Deleting\nthe file resets everything to defaults."
+config_missing = "No config directory available — this run uses built-in defaults only."
 
 [log]
 runtime = "RUNTIME LOG"

@@ -9,9 +9,10 @@
 //   auto —— 跟随系统（默认）：读 Windows 的"显示语言"，中文系统 → zh，其它 → en
 //   en   —— 强制英文
 //   zh   —— 强制简体中文
-// 优先级：环境变量 PCSPEAKER_LANG  >  settings.txt 里的 language  >  系统语言
+// 优先级：环境变量 PCSPEAKER_LANG  >  config.json 的 language
+//                        > （升级迁移）老 settings.txt  >  系统语言
 // （环境变量排在最前，是为了截图验证/排错时能一行命令切换界面语言，
-//   不用去动用户的 settings.txt。）
+//   不用去动用户的配置文件。）
 //
 // 文案本体在仓库根的 locales/en.toml 与 locales/zh.toml，
 // 由 lib.rs 里的 `i18n!("locales", fallback = "en")` 在【编译期】读进来，
@@ -241,21 +242,40 @@ language={}\n",
 // ──────────────────────────────────────────────────────────────────────────
 
 /// 决定并应用启动语言，返回"最终生效的语言 + 是谁决定的"（写日志用）
+///
+/// v3.8 起优先级是：环境变量 PCSPEAKER_LANG > config.json 的 language
+/// > （升级迁移）老 settings.txt > 系统显示语言。
+/// 这里顺带负责把 config.json 读进来（config::init 幂等，谁先调都行）。
 pub fn apply_startup_locale() -> (&'static str, &'static str) {
-    let path = settings_path();
+    let loaded = crate::config::init();
+    let mut cfg = loaded.config.clone();
+
+    // 升级迁移：老版本只有 settings.txt。如果 config.json 是【这次新建】的，
+    // 而 settings.txt 里存过一个明确选择（不是 auto），就把它搬进 config.json ——
+    // 老用户升级后语言不会莫名其妙变回跟随系统。
+    if loaded.created {
+        let legacy = saved_choice(&settings_path());
+        if legacy != LanguageChoice::Auto {
+            cfg.language = legacy.as_str().to_string();
+            if let Err(e) = crate::config::update(cfg.clone()) {
+                log::warn!("[Lang] migrate settings.txt -> config.json failed: {e}");
+            }
+        }
+    }
+
     let (code, source) = if let Ok(env_v) = std::env::var("PCSPEAKER_LANG") {
         let c = LanguageChoice::parse(&env_v);
         remember_choice(c);
         (c.resolve(), "env PCSPEAKER_LANG")
     } else {
-        let saved = saved_choice(&path);
-        remember_choice(saved);
-        let source = if saved == LanguageChoice::Auto {
+        let c = LanguageChoice::parse(&cfg.language);
+        remember_choice(c);
+        let source = if c == LanguageChoice::Auto {
             "system language"
         } else {
-            "settings.txt"
+            "config.json"
         };
-        (saved.resolve(), source)
+        (c.resolve(), source)
     };
     set_locale(code);
     log::info!("[Lang] UI locale = {code} (from {source})");
@@ -263,10 +283,15 @@ pub fn apply_startup_locale() -> (&'static str, &'static str) {
 }
 
 /// 在设置页里切换语言：立刻生效 + 落盘。返回落盘错误（界面会显示出来）
+///
+/// 落盘写的是 config.json。settings.txt 从此【只读不写】：
+/// 老实现是整文件重写，继续留着它等于让用户面对两份会说谎的配置。
 pub fn switch_to(choice: LanguageChoice) -> std::io::Result<()> {
     set_locale(choice.resolve());
     remember_choice(choice);
-    save_choice(&settings_path(), choice)
+    let mut cfg = crate::config::get();
+    cfg.language = choice.as_str().to_string();
+    crate::config::update(cfg)
 }
 
 /// 把 "zh" / "en" 显示成给用户看的名字（语言名一律用它自己的写法，不翻译）

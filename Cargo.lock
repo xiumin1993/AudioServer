@@ -533,6 +533,8 @@ dependencies = [
  "local-ip-address",
  "log",
  "rust-i18n",
+ "serde",
+ "serde_json",
  "tokio",
  "tokio-tungstenite",
  "windows 0.58.0",

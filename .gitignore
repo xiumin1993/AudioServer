@@ -26,8 +26,12 @@ ui-design*.html
 # 运行/构建日志
 *.log
 
-# 第三方源码压缩包（解压目录 third_party/UnityCapture-master 已提交）
-third_party/*.zip
+# 第三方参考源码（UnityCapture 官方包解压产物）：新机器 cargo build 一行都用不到
+# —— 没有 build.rs，也没有任何 C++ 参与编译，共享内存协议是照 shared.inl 手写的。
+# 按「构建不需要的文件不入库」原则不再跟踪，只留在本地磁盘。
+# 注意：本机注册的虚拟摄像头滤镜 DLL 就指向这个目录（HKLM CLSID\{5C2CD55C-…}\InprocServer32），
+# 所以只能取消跟踪，不能删文件——删了 DirectShow 会找不到滤镜，摄像头设备直接消失。
+third_party/
 
 # graphify 知识图谱产物（本地生成物，可由 graphify extract 重新生成，不入库）
 /graphify-out/

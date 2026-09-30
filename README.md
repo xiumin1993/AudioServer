@@ -132,7 +132,7 @@ src/mic_out.rs   手机上行 PCM → VB-CABLE 注入（含 44.1k↔48k 线性�
 src/vcam.rs      Unity Capture 共享内存发送端（协议移植自官方 shared.inl）
 src/vcam_obs.rs  OBS Virtual Camera 共享内存队列发送端（NV12 三槽环）
 src/bin/         设备枚举探针（调试用）
-third_party/     UnityCapture 官方源码+安装包（MIT）
+third_party/     UnityCapture 官方源码（MIT，仅本地参考，已 .gitignore 不入库）
 ```
 
 协议：文本 JSON 控制帧 + 二进制媒体帧。麦克风 PCM 无标记直传；摄像头 JPEG 帧带 4 字节魔术头 `[0x03,'C','A','M']` 分流。

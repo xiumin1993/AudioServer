@@ -20,7 +20,7 @@
 | 1 | Windows 10/11 x64 | ✅ | 音频注入与虚拟摄像头均为 Windows 专用（WASAPI + DirectShow） |
 | 2 | 手机与电脑在**同一局域网** | ✅ | 建议 5GHz WiFi 或 USB 有线（见 §5）；2.4GHz 干扰大时帧率会掉 |
 | 3 | [VB-Audio Virtual Cable](https://vb-audio.com/Cable/) | 麦克风模式必须 | 免费驱动。装完后播放设备里出现 `CABLE Input`、录音设备里出现 `CABLE Output` |
-| 4 | Unity Capture 虚拟摄像头驱动 | 摄像头模式必须 | 本仓库已附带：`third_party/UnityCapture-master/Install/Install.bat`（MIT 协议源码+预编译 DLL） |
+| 4 | 虚拟摄像头驱动（Unity Capture 或 OBS 任一） | 摄像头模式必须 | 需**自行下载安装**：[Unity Capture](https://github.com/Unity-Technologies/Unity-Capture) 或 OBS Studio（见第 5 行）。本程序不附带任何驱动或安装脚本；仓库里的 `third_party/UnityCapture-master/` 只是开发期参考源码（Rust 发送端按它的共享内存格式实现），不进发行包 |
 | 5 | OBS Virtual Camera（可选） | 浏览器场景推荐 | 安装任意版本的 [OBS Studio](https://obsproject.com)。Unity 驱动是 DirectShow 的，**Edge/Chrome 浏览器只认 MF 设备**，需要 OBS 虚拟摄像头兜底（服务器会同时向两个驱动注帧，装哪个都无所谓） |
 | 6 | Windows 服务 `FrameServer`（Windows Camera Frame Server） | 浏览器场景必须 | 若浏览器枚举不到任何摄像头：`services.msc` → 找到 "Windows Camera Frame Server" → 启动。设为"自动"需管理员：`sc config FrameServer start=auto`（改系统服务，请自行决定） |
 | 7 | Rust 工具链 | 仅自行编译时 | [rustup](https://rustup.rs/) 稳定版即可；直接下载 Release  exe 则不需要 |
@@ -35,10 +35,12 @@
 1. 官网下载 → 右键"以管理员运行"安装 → 重启。
 2. 验证：`Win+R` → `mmsys.cpl`，"录制"页出现 `CABLE Output`。
 
-### 2.2 Unity Capture（摄像头模式）
-1. 进入 `third_party\UnityCapture-master\Install\`；
-2. 右键 `Install.bat` → **以管理员运行**（会 regsvr32 注册 DirectShow filter）；
+### 2.2 Unity Capture（摄像头模式，可选其一）
+1. 从项目主页下载并解压 [Unity-Capture](https://github.com/Unity-Technologies/Unity-Capture)（官方 zip 内含 `Install` 目录）；
+2. 进入解压后的 `Install\`，右键 `Install.bat` → **以管理员运行**（会 regsvr32 注册 DirectShow filter）；
 3. 验证：设备管理器或任意摄像头选择界面出现 **"Unity Video Capture"**。
+
+> 本程序**不会**替你执行上面任何一步，也不随包附带 `Install.bat`；缺驱动时只做检测与文字提示。
 
 ### 2.3 OBS Virtual Camera（可选，浏览器兜底）
 安装 OBS Studio 即自动注册（无需启动 OBS 本体，服务器直接写它的共享内存队列）。
@@ -68,8 +70,9 @@ audioserver.exe --port 8080 --sample-rate 48000 --channels 2 --buffer-size 1024
 **启动自检门禁（v3.5）**：GUI 与 CLI 启动时都会先做一次**只读**检测——
 VB-CABLE（查声卡列表里的 `CABLE Input/Output`）+ Unity Capture / OBS Virtual Camera
 任一（查两个滤镜的 CLSID 是否注册）。必需项齐全才进主界面并起服务端；
-缺项时 GUI 整页显示"需要准备驱动"向导（可打开官网下载页，或一键运行随包 `drivers/UnityCapture/Install.bat`），
-**8080 根本不监听**；CLI 打印缺项后以退出码 2 结束。FrameServer 只作为提示，不参与放行。
+缺项时 GUI 整页显示"需要准备驱动"向导，**只有文字提示 + 打开对应官网下载页的按钮**
+（不附带安装脚本、不替你装任何东西），**8080 根本不监听**；CLI 打印缺项与下载网址后以退出码 2 结束。
+FrameServer 只作为提示，不参与放行。
 开发开关：`PCSPEAKER_SKIP_ENV_CHECK=1` 跳过门禁，`PCSPEAKER_FORCE_ENV_GUIDE=1` 强制停在向导页，
 CLI 用 `--skip-env-check`。
 

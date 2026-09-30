@@ -4,7 +4,7 @@
 # without a BOM using the active ANSI codepage, which garbles Chinese strings and
 # would produce corrupted file names inside the package):
 #   1. cargo build --release (optimized + stripped, see [profile.release] in Cargo.toml)
-#   2. stage dist/AudioServer-<version>-win-x64/ : GUI exe + CLI exe + docs + drivers
+#   2. stage dist/AudioServer-<version>-win-x64/ : GUI exe + CLI exe + docs
 #   3. zip it up and print size + SHA-256 so the receiver can verify the download
 #
 # Usage:
@@ -44,18 +44,22 @@ $zip      = Join-Path $root "dist\$pkgName.zip"
 Write-Host "==> packaging $pkgName (commit $commit, built $builtAt)"
 
 # ---- 3. stage the tree ------------------------------------------------------
-if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+# 注意：包里【不附带任何驱动或驱动安装脚本】。缺驱动时程序启动自检会给文字提示，
+# 用户自己去官网下载。这样包更小，也不会碰用户系统。
+if (Test-Path $stage) { Remove-Item $stage -Recurse -Force -ErrorAction Continue }
+if (Test-Path $stage) {
+    # A leftover dir would silently mix the previous build's files into this package
+    # (that is exactly how an old drivers\ folder once survived into a "clean" tree).
+    Write-Host "STAGING DIR COULD NOT BE CLEANED: $stage"
+    Write-Host 'Close any Explorer window / terminal whose cwd is inside it, then re-run.'
+    exit 1
+}
 New-Item -ItemType Directory -Path $stage | Out-Null
-New-Item -ItemType Directory -Path (Join-Path $stage 'drivers\UnityCapture') | Out-Null
 
 Copy-Item $exe (Join-Path $stage 'audioserver.exe')
 Copy-Item (Join-Path $root 'target\release\server.exe') (Join-Path $stage 'server.exe')
 Copy-Item (Join-Path $root 'README.md') (Join-Path $stage 'README.md')
 Copy-Item (Join-Path $root 'docs\quick-start.md') (Join-Path $stage 'quick-start.md')
-
-# Virtual camera driver payload (MIT-licensed source we ship alongside the server)
-$installSrc = Join-Path $root 'third_party\UnityCapture-master\Install'
-Copy-Item "$installSrc\*" (Join-Path $stage 'drivers\UnityCapture') -Recurse
 
 # Launcher: keeps the window visible (a background process is confusing to users)
 $bat = @"
@@ -77,15 +81,22 @@ sha256(exe): $( (Get-FileHash $exe -Algorithm SHA256).Hash )
 
 # ---- 4. verify the staged tree, then zip ------------------------------------
 $must = @('audioserver.exe', 'server.exe', 'README.md', 'quick-start.md',
-          'start-audioserver.bat', 'VERSION.txt',
-          'drivers\UnityCapture\Install.bat', 'drivers\UnityCapture\UnityCaptureFilter64.dll')
+          'start-audioserver.bat', 'VERSION.txt')
 foreach ($m in $must) {
     if (-not (Test-Path (Join-Path $stage $m))) {
         Write-Host "MISSING in package: $m"
         exit 1
     }
 }
-Write-Host ("==> staged tree ok (" + $must.Count + " required entries present)")
+# Guard: no driver / driver-install payload may ever end up in the package.
+$forbidden = Get-ChildItem $stage -Recurse -Include '*.bat', '*.msi', '*.dll', '*.inf' -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -ne 'start-audioserver.bat' }
+if ($forbidden) {
+    Write-Host 'PACKAGE MUST NOT CONTAIN DRIVER FILES:'
+    $forbidden | ForEach-Object { Write-Host ('  ' + $_.FullName) }
+    exit 1
+}
+Write-Host ("==> staged tree ok (" + $must.Count + " required entries, no driver payload)")
 
 if (Test-Path $zip) { Remove-Item $zip -Force }
 Compress-Archive -Path $stage -DestinationPath $zip -CompressionLevel Optimal

@@ -48,12 +48,11 @@ async fn main() -> Result<()> {
                 eprintln!("  缺少：{m}");
             }
             eprintln!(
-                "\n  VB-CABLE 下载：https://vb-audio.com/Cable/\n  \
-                 OBS Studio 下载（自带 OBS Virtual Camera）：https://obsproject.com/download"
+                "\n  本程序不附带、也不运行任何驱动安装脚本，请自行下载后按官方说明安装：\n  \
+                 VB-CABLE：https://vb-audio.com/Cable/\n  \
+                 OBS Studio（自带 OBS Virtual Camera）：https://obsproject.com/download\n  \
+                 Unity Capture：https://github.com/Unity-Technologies/Unity-Capture"
             );
-            if let Some(p) = &report.driver_installer_path {
-                eprintln!("  或运行随包的 Unity Capture 注册脚本：{p}");
-            }
             eprintln!("\n（确认知道自己在做什么时，可加 --skip-env-check 强行启动）");
             std::process::exit(2);
         }

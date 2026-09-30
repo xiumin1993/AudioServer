@@ -10,7 +10,12 @@
 //   现在改成：双击 exe 先做一次只读检测；
 //     · 必需项齐 → 直接进主界面（行为和以前完全一样）
 //     · 必需项缺 → 主窗口只显示"环境准备"向导页，服务端线程【根本不起】，
-//                  页面上给下载链接 + 随包一键注册 + "重新检测"按钮。
+//                  页面上只给"缺什么 + 去哪下载 + 怎么装"的文字提示，
+//                  装完回来点【重新检测】。
+//
+// 本程序与驱动的关系，一句话：【只检测、只提示】。
+//   不随包附带任何安装脚本（没有 Install.bat），不代跑任何 regsvr32 / msiexec，
+//   也不写注册表、不改服务配置。要不要装、怎么装，决定权完全在用户手上。
 //
 // 三条检测都是"看现场、不自查注册"：
 //   1) VB-CABLE —— 用 cpal 枚举声卡设备名，出现 CABLE Input / CABLE Output 即已装
@@ -21,8 +26,8 @@
 //   3) Windows Camera Frame Server 服务 —— 只作为【提示】，不参与放行判断：
 //      浏览器枚举不到摄像头八成是它没跑，但桌面会议软件不受影响。
 //
-// 约定：本文件只做只读检测 + 调用系统已有能力（开浏览器 / 跑随包 Install.bat），
-//       绝不写注册表、绝不改服务配置。
+// 约定：本文件只做只读检测 + 把用户要去的官网用默认浏览器打开，
+//       绝不写注册表、绝不改服务配置、绝不运行任何驱动安装脚本。
 // ============================================================================
 
 use eframe::egui;
@@ -41,8 +46,6 @@ pub struct EnvReport {
     pub frameserver_running: Option<bool>,
     /// 枚举到的音频设备名（调试用，向导页可展开查看）
     pub audio_devices: Vec<String>,
-    /// 随包附带的虚拟摄像头驱动安装脚本路径（找到才给"一键注册"按钮）
-    pub driver_installer_path: Option<String>,
     /// 非 Windows 平台（Mac 移植/调试期）：跳过门禁，避免挡住开发
     pub skipped: bool,
 }
@@ -58,7 +61,6 @@ impl EnvReport {
             obs: false,
             frameserver_running: None,
             audio_devices: Vec::new(),
-            driver_installer_path: bundled_driver_installer(),
             skipped: false,
         }
     }
@@ -95,7 +97,6 @@ pub fn detect() -> EnvReport {
         obs: true,
         frameserver_running: None,
         audio_devices: Vec::new(),
-        driver_installer_path: None,
         skipped: true,
     }
 }
@@ -115,7 +116,6 @@ pub fn detect() -> EnvReport {
         obs: clsid_registered(OBS_VIRTUAL_CAMERA_CLSID),
         frameserver_running: frameserver_running(),
         audio_devices: audio,
-        driver_installer_path: bundled_driver_installer(),
         skipped: false,
     };
     log::info!(
@@ -206,40 +206,10 @@ fn frameserver_running() -> Option<bool> {
     }
 }
 
-/// 找出随包发布的虚拟摄像头安装脚本。
-/// 发行包布局 = exe 同级的 drivers/UnityCapture/；
-/// 开发时从 target/release 里跑，则回退到仓库内 third_party/…/Install/。
-#[cfg(windows)]
-fn bundled_driver_installer() -> Option<String> {
-    let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    let candidates = [
-        exe_dir.join("drivers").join("UnityCapture").join("Install.bat"),
-        exe_dir.join("UnityCapture").join("Install.bat"),
-        exe_dir
-            .join("..")
-            .join("..")
-            .join("third_party")
-            .join("UnityCapture-master")
-            .join("Install")
-            .join("Install.bat"),
-    ];
-    for c in candidates {
-        if c.is_file() {
-            log::info!("[EnvCheck] bundled driver installer: {}", c.display());
-            return Some(c.to_string_lossy().to_string());
-        }
-    }
-    None
-}
-
-/// 非 Windows：没有"随包 Install.bat"这回事（Mac 的虚拟音频/摄像头另走方案）
-#[cfg(not(windows))]
-fn bundled_driver_installer() -> Option<String> {
-    None
-}
-
 // ──────────────────────────────────────────────────────────────────────────
-// 动作按钮：打开网页 / 跑随包安装脚本。都调用系统已有能力，不自己实现。
+// 动作按钮：只用系统默认浏览器打开驱动官网页面。
+// 本程序不附带、不查找、也不运行任何驱动安装脚本 —— 缺驱动时只做文字提示，
+// 用户自己去官网下载、自己决定要不要装。
 // ──────────────────────────────────────────────────────────────────────────
 
 /// 用系统默认浏览器打开链接
@@ -253,19 +223,6 @@ pub fn open_url(url: &str) {
     #[cfg(not(windows))]
     {
         let _ = Command::new("open").arg(url).spawn();
-    }
-}
-
-/// 运行随包的 Install.bat（脚本内部自带 UAC 提权，会弹一次授权框）
-pub fn run_bundled_installer(path: &str) {
-    log::info!("[EnvCheck] running driver installer: {path}");
-    #[cfg(windows)]
-    {
-        let _ = Command::new("cmd").args(["/C", "start", "", path]).spawn();
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = path;
     }
 }
 
@@ -403,10 +360,10 @@ impl EnvGuide {
                 );
                 ui.label(
                     egui::RichText::new(
-                        "本程序是绿色单文件，不写注册表、不自动安装任何东西。\n\
+                        "本程序是绿色单文件：不写注册表、不附带安装脚本、也不会替你装任何东西。\n\
                          但手机当电脑麦克风/摄像头要靠系统里的虚拟驱动，缺这些驱动时\n\
                          程序不会启动服务端，免得连上手机才发现选不到设备。\n\
-                         按下面装好，回来点【重新检测】即可进入主界面。",
+                         请自己按下面的说明装好，回来点【重新检测】即可进入主界面。",
                     )
                     .size(13.0),
                 );
@@ -475,39 +432,32 @@ impl EnvGuide {
                 );
                 if !cam_ok {
                     ui.indent("cam", |ui| {
-                        let mut spawned = false;
-                        // 注意：这里在闭包里读 self 的字段，先 clone 出来避免借用冲突
-                        let installer = self.report.driver_installer_path.clone();
-                        if let Some(p) = installer {
-                            if ui
-                                .button("一键注册随包附带的 Unity Capture 驱动")
-                                .on_hover_text(
-                                    "只运行安装包里的 Install.bat（regsvr32 注册滤镜），会弹一次 UAC 授权",
-                                )
-                                .clicked()
-                            {
-                                run_bundled_installer(&p);
-                                spawned = true;
-                            }
-                            ui.label(egui::RichText::new(format!("脚本位置：{p}")).size(11.0));
-                        } else {
-                            ui.label(
-                                egui::RichText::new(
-                                    "（没找到随包的 drivers/UnityCapture/Install.bat，请确认发行包完整解压后再试）",
-                                )
-                                .size(12.0),
-                            );
-                        }
-                        if ui.button("打开 OBS Studio 下载页").clicked() {
+                        let mut opened = false;
+                        if ui
+                            .button("打开 OBS Studio 下载页")
+                            .on_hover_text("最简单的一路：装 OBS Studio，自带 OBS Virtual Camera")
+                            .clicked()
+                        {
                             open_url("https://obsproject.com/download");
-                            spawned = true;
+                            opened = true;
                         }
-                        if spawned {
-                            self.status = "装好后回来点【重新检测】".to_string();
+                        if ui
+                            .button("打开 Unity Capture 项目主页")
+                            .on_hover_text(
+                                "下载解压后，进 Install 文件夹右键\"以管理员身份运行\" Install.bat",
+                            )
+                            .clicked()
+                        {
+                            open_url("https://github.com/Unity-Technologies/Unity-Capture");
+                            opened = true;
+                        }
+                        if opened {
+                            self.status = "已打开下载页：装好后回来点【重新检测】".to_string();
                         }
                         ui.label(
                             egui::RichText::new(
-                                "两个驱动的区别：Unity 是 DirectShow 滤镜，钉钉/腾讯会议/OBS 能选到；\n\
+                                "本程序不会替你安装任何驱动，也不附带安装脚本 —— 只负责检测并提示。\n\
+                                 两个驱动的区别：Unity 是 DirectShow 滤镜，钉钉/腾讯会议/OBS 能选到；\n\
                                  Edge/Chrome 浏览器只认 OBS Virtual Camera（装了 OBS 就有，无需额外配置）。",
                             )
                             .size(12.0),
@@ -587,7 +537,6 @@ mod tests {
             obs,
             frameserver_running: None,
             audio_devices: Vec::new(),
-            driver_installer_path: None,
             skipped: false,
         }
     }
@@ -626,7 +575,6 @@ mod tests {
             obs: false,
             frameserver_running: None,
             audio_devices: Vec::new(),
-            driver_installer_path: None,
             skipped: true,
         };
         assert!(r.ready(), "非 Windows 平台不该被门禁挡住");

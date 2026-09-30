@@ -1,6 +1,9 @@
 # Rust 编译产物
 /target/
 
+# 打包输出（正式 exe + zip，体积大且可由 pack_release.ps1 重新生成）
+/dist/
+
 # Cargo 锁文件（库项目不提交，应用项目可提交）
 # Cargo.lock
 

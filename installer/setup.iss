@@ -16,7 +16,8 @@
 ;   * It does not touch services, startup entries, firewall rules, or any registry
 ;     key beyond the standard uninstall entry Inno itself creates.
 ;   * It does NOT overwrite an existing %APPDATA%\PCAssistant\config.json on upgrade
-;     (onlyifdoesntexist), so tuned settings survive a re-install.
+;     (EnsureUserConfig below copies the shipped default only when the file is absent),
+;     so a user's tuned settings survive re-installing.
 ;   * Uninstall keeps %APPDATA%\PCAssistant (config = user settings, log = evidence
 ;     for a bug report). Delete that folder by hand for a full reset.
 ;
@@ -100,14 +101,15 @@ Source: "{#StageDir}\VERSION.txt";     DestDir: "{app}"; Flags: ignoreversion
 ; The shipped starting-point config, generated at pack time by
 ;   server.exe --print-default-config
 ; so the file the user gets can never drift away from the defaults compiled into the
-; exe. DestName renames it to config.json; onlyifdoesntexist = "give the user a
-; config.json, never clobber one they already edited".
-Source: "{#StageDir}\config.default.json"; DestDir: "{userappdata}\PCAssistant"; DestName: "config.json"; Flags: onlyifdoesntexist
+; exe. It stays in {app} as a reference copy; the user's own config.json is created
+; next to it in [Code] (see EnsureUserConfig - deliberately NOT via [Files], because
+; Inno's uninstaller deletes every file [Files] installed, and a user's tuned
+; settings must outlive an uninstall).
+Source: "{#StageDir}\config.default.json"; DestDir: "{app}"; Flags: ignoreversion
 
 [Dirs]
-; The app creates this folder itself on first run; making it here too means the config
-; file above always has a home, even on a profile where the first write would race.
-Name: "{userappdata}\PCAssistant"
+; (intentionally empty) - %APPDATA%\PCAssistant is created by [Code] and by the app
+; itself, so Inno never owns it and never removes it on uninstall.
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\audioserver.exe"; WorkingDir: "{app}"; Comment: "Run PC Assistant AudioServer (phone as PC speaker / microphone / webcam)"
@@ -129,12 +131,42 @@ Filename: "{app}\audioserver.exe"; Description: "Launch {#MyAppName} now"; Flags
 Type: files; Name: "{app}\audioserver.log"
 
 [Code]
+// Give the user a config.json without ever taking one away.
+//
+// Why this is done in code instead of a [Files] entry: everything [Files] installs is
+// deleted again by the uninstaller, and %APPDATA%\PCAssistant\config.json is user
+// data - losing it on uninstall (or on "repair") is exactly the kind of thing people
+// never notice until their tuned settings are gone. The app itself also creates this
+// file on first run, so this is only a head start, never an override.
+procedure EnsureUserConfig;
+var
+  Dir, Src, Dst: String;
+begin
+  Dir := ExpandConstant('{userappdata}\PCAssistant');
+  Src := ExpandConstant('{app}\config.default.json');
+  Dst := Dir + '\config.json';
+  if FileExists(Dst) then
+    Log('User config already exists, left untouched: ' + Dst)
+  else if not FileExists(Src) then
+    Log('No config.default.json in {app}; the app will create the config on first run')
+  else if CreateDir(Dir) or DirExists(Dir) then
+  begin
+    if FileCopy(Src, Dst, False) then
+      Log('Created user config from the shipped default: ' + Dst)
+    else
+      Log('Could not write ' + Dst + '; the app will create it on first run');
+  end
+  else
+    Log('Could not create ' + Dir + '; the app will create it on first run');
+end;
+
 // Write the resolved paths into the setup log: "which folder, which config, and the
 // fact that no driver was installed" is the first thing a support thread needs.
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
   begin
+    EnsureUserConfig;
     Log('PC Assistant AudioServer {#MyAppVersion} installed to ' + ExpandConstant('{app}'));
     Log('Config file: ' + ExpandConstant('{userappdata}\PCAssistant\config.json'));
     Log('No driver was installed by this setup. VB-CABLE / Unity Capture / OBS Virtual');

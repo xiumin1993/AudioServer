@@ -38,6 +38,40 @@ thread_local! {
     static BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(512));
 }
 
+/// 日志文件实际落在哪（第一次用到时定下来，之后不再变）
+static LOG_PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
+
+/// 选日志文件路径。
+///
+/// 规则：能写就写在 exe 旁边（绿色版 / 开发时的老习惯，README 里也是这么写的），
+/// 写不动就退回配置目录 %APPDATA%\PCAssistant。
+/// 为什么必须有退路：安装版把 exe 放进 Program Files，普通用户权限在那里**建不了文件**，
+/// 原来的代码会静默失败——出问题时用户手里没有日志，我们远程也问不到现场。
+fn log_file_path() -> std::path::PathBuf {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    if let Some(dir) = exe_dir {
+        let candidate = dir.join("audioserver.log");
+        // 试探性打开一次（create+append 等价于"能不能在这儿写"），成功就定在这儿
+        if OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&candidate)
+            .is_ok()
+        {
+            return candidate;
+        }
+    }
+    // 退路：配置目录（config::init() 已经保证它存在；拿不到目录就写当前目录）
+    config::config_dir().unwrap_or_else(|| std::path::PathBuf::from(".")).join("audioserver.log")
+}
+
+/// 给界面 / 日志用的当前日志文件路径
+fn log_path() -> std::path::PathBuf {
+    LOG_PATH.get_or_init(log_file_path).clone()
+}
+
 impl Log for DualLogger {
     fn enabled(&self, meta: &Metadata) -> bool {
         meta.level() <= self.level
@@ -62,14 +96,10 @@ impl Log for DualLogger {
             let _ = std::io::stderr().write_all(&b);
             // 文件（lazy init，只打开一次）
             if self.log_file.get().is_none() {
-                let exe_dir = std::env::current_exe()
-                    .ok()
-                    .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-                    .unwrap_or_default();
                 if let Ok(f) = OpenOptions::new()
                     .create(true)
                     .append(true)
-                    .open(exe_dir.join("audioserver.log"))
+                    .open(log_path())
                 {
                     let _ = self.log_file.set(f);
                 }
@@ -204,9 +234,12 @@ fn main() -> eframe::Result<()> {
     install_panic_logger();
     log::info!("[Main] AudioServer starting (dual logger: stderr + audioserver.log)");
     log_config(&loaded);
+    // 日志写在哪必须在第一屏就说清楚：绿色版在 exe 旁边，装进 Program Files 会退到
+    // %APPDATA%\PCAssistant。出问题时第一条要问的就是这个路径。
+    log::info!("[Main] log file: {}", log_path().display());
 
     // i18n：先决定界面语言，再画任何一帧。
-    // 优先级 = PCSPEAKER_LANG 环境变量 > exe 同目录 settings.txt > 系统显示语言。
+    // 优先级 = PCSPEAKER_LANG 环境变量 > config.json 的 language > 系统显示语言。
     // 放在这里（而不是 App::new 里）是因为窗口标题在 run_native 就要用到文案。
     let (locale, locale_from) = lang::apply_startup_locale();
     log::info!("[Main] UI language = {locale} (from {locale_from})");
@@ -2246,6 +2279,18 @@ impl AudioServerApp {
                 egui::RichText::new(text)
                     .size(11.0)
                     .color(colors::TEXT_SECONDARY),
+            );
+            // 日志文件位置也摊开：绿色版写在 exe 旁边，装进 Program Files 会写在
+            // %APPDATA%\PCAssistant，用户/客服不用猜。
+            ui.add_space(4.0);
+            let log_line = lang::tf(
+                "settings.log_path",
+                &[("path", &log_path().display().to_string())],
+            );
+            ui.label(
+                egui::RichText::new(log_line)
+                    .size(11.0)
+                    .color(colors::TEXT_MUTED),
             );
         });
     }

@@ -21,8 +21,25 @@ use std::sync::Mutex;
 /// 上行样本队列：手机线程写入，注入线程消费。存的是 i16 单声道样本。
 pub type MicQueue = Arc<Mutex<VecDeque<i16>>>;
 
-/// 队列积压上限（样本数）。48kHz 下约 250ms，再大说明网络比实时快，丢旧保新。
-const MAX_QUEUE_SAMPLES: usize = 12000;
+/// 队列积压上限（样本数）。
+///
+/// v3.8 起由 config.json 算出来：`mic.max_queue_ms × mic.uplink_sample_rate / 1000`
+/// （默认 250ms × 48000 = 12000 个样本，和以前写死的值一模一样）。
+/// 超过上限说明网络比实时快，丢最旧的保最新（不丢就会越积越多变成回声）。
+/// 用 OnceLock 缓存：push_uplink 每个上行包都会进来一次，配置只在第一次用时读。
+fn max_queue_samples() -> usize {
+    static CACHE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let cfg = crate::config::get();
+        let n = (cfg.mic.max_queue_ms as usize * cfg.mic.uplink_sample_rate as usize) / 1000;
+        let n = n.max(1024);
+        info!(
+            "[MicOut] uplink queue cap = {} samples ({} ms @ {} Hz, from config)",
+            n, cfg.mic.max_queue_ms, cfg.mic.uplink_sample_rate
+        );
+        n
+    })
+}
 
 // ── v3.4.4 上行采样率开关 + 重采样 ─────────────────────────────────
 /// 手机实际发来的 PCM 采样率（44100 / 48000），服务器收到 mic_start 时更新。
@@ -46,6 +63,43 @@ const CABLE_RENDER_HINT: &str = "CABLE INPUT";
 /// VB-CABLE 的录音端名片段（占用检测用：应用录的是 "CABLE Output"）
 const CABLE_CAPTURE_HINT: &str = "CABLE OUTPUT";
 
+// ── v3.8：设备名可以从 config.json 改 ────────────────────────────────────
+// 为什么要能改：换一根虚拟声卡（VoiceMeeter、Matrix 之类）以前得改代码重编译，
+// 现在改两行配置就行。匹配规则没变：设备友好名【转大写后做包含匹配】。
+// 填成空串 = 回到默认那对 VB-CABLE 名字（不是"随便挑一台"）：
+// 宁可找不到设备、界面上明说"没找到"，也绝不能把手机的声音默默灌进真实扬声器 ——
+// 那会变成当场回授啸叫，是最难查的一种事故。
+
+/// 注入目标（播放端）设备名片段，已转大写
+fn inject_hint() -> String {
+    let h = crate::config::get().mic.inject_device_hint;
+    if h.trim().is_empty() {
+        CABLE_RENDER_HINT.to_string()
+    } else {
+        h.to_uppercase()
+    }
+}
+
+/// 占用检测（录音端）设备名片段，已转大写
+fn monitor_hint() -> String {
+    let h = crate::config::get().mic.monitor_capture_hint;
+    if h.trim().is_empty() {
+        CABLE_CAPTURE_HINT.to_string()
+    } else {
+        h.to_uppercase()
+    }
+}
+
+/// 手机还没上报自己的上行采样率时，用 config.json 里的 mic.uplink_sample_rate 打底。
+/// 手机一旦发过 mic_start 声明了自己的采样率，set_uplink_rate 会覆盖这个值。
+pub fn apply_startup_rate() {
+    let sr = crate::config::get().mic.uplink_sample_rate;
+    if (8000..=192_000).contains(&sr) {
+        UPLINK_RATE.store(sr, std::sync::atomic::Ordering::Relaxed);
+        info!("[MicOut] Default uplink sample rate from config: {sr} Hz");
+    }
+}
+
 pub fn new_queue() -> MicQueue {
     Arc::new(Mutex::new(VecDeque::with_capacity(2048)))
 }
@@ -56,7 +110,7 @@ pub fn push_uplink(queue: &MicQueue, bytes: &[u8]) {
     for chunk in bytes.chunks_exact(2) {
         q.push_back(i16::from_le_bytes([chunk[0], chunk[1]]));
     }
-    let overflow = q.len().saturating_sub(MAX_QUEUE_SAMPLES);
+    let overflow = q.len().saturating_sub(max_queue_samples());
     if overflow > 0 {
         q.drain(..overflow);
     }
@@ -202,18 +256,21 @@ mod windows_impl {
         }
     }
 
-    /// 枚举 CABLE Output 捕获端点上的音频会话：有 Active 会话 = 应用在录
+    /// 枚举虚拟声卡录音端点上的音频会话：有 Active 会话 = 应用在录
     fn cable_output_in_use(enumerator: &IMMDeviceEnumerator) -> Result<bool> {
         use windows::core::Interface;
         use windows::Win32::Media::Audio::{
             eCapture, IAudioSessionControl2, IAudioSessionManager2, AudioSessionStateActive,
         };
 
+        // 设备名片段每次调用取一次（不是每台设备取一次）：这个函数由占用检测线程
+        // 每 250ms 调一轮，配置里改的名字下一轮就生效
+        let hint = monitor_hint();
         let collection = unsafe { enumerator.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)? };
         let count = unsafe { collection.GetCount()? };
         for i in 0..count {
             let device = unsafe { collection.Item(i)? };
-            if !device_friendly_name(&device).to_uppercase().contains(CABLE_CAPTURE_HINT) {
+            if !device_friendly_name(&device).to_uppercase().contains(&hint) {
                 continue;
             }
             let mgr: IAudioSessionManager2 = unsafe { device.Activate(CLSCTX_ALL, None)? };
@@ -246,8 +303,9 @@ mod windows_impl {
         is_f32: bool,
     }
 
-    /// 枚举播放设备，找名字含 "CABLE Input" 的那台并建立共享渲染流
+    /// 枚举播放设备，找名字含 inject_device_hint（默认 "CABLE Input"）的那台并建立共享渲染流
     fn open_cable_render(enumerator: &IMMDeviceEnumerator) -> Result<MicOutputStream> {
+        let hint = inject_hint();
         let collection =
             unsafe { enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)? };
         let count = unsafe { collection.GetCount()? };
@@ -255,16 +313,18 @@ mod windows_impl {
         for i in 0..count {
             let device = unsafe { collection.Item(i)? };
             let name = device_friendly_name(&device);
-            if name.to_uppercase().contains(CABLE_RENDER_HINT) {
+            if name.to_uppercase().contains(&hint) {
                 chosen = Some((device, name));
                 break;
             }
         }
         let (device, device_name) = match chosen {
             Some(d) => d,
+            // 报错里带上"我在找谁"，用户改了配置写错名字时一眼能看出来
             None => anyhow::bail!(
-                "VB-CABLE render device '{}' not found — install VB-Audio Virtual Cable",
-                CABLE_RENDER_HINT
+                "virtual audio render device '{}' not found — install VB-Audio Virtual Cable \
+                 or fix mic.inject_device_hint in config.json",
+                hint
             ),
         };
 

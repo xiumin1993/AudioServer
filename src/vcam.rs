@@ -275,12 +275,18 @@ mod windows_impl {
     /// 挂一张黑底占位图（头部字段走 write_header，与真实帧完全一致），
     /// 让摄像头应用打开后不会看到随机内存垃圾。
     unsafe fn write_placeholder(s: &Sender) {
-        const PW: i32 = 640;
-        const PH: i32 = 480;
+        // v3.8：占位帧尺寸来自 config.json 的 camera.placeholder_width/height
+        // （默认仍是 640x480）。这个函数只在"刚挂上共享内存"时调用，不是每帧，
+        // 所以在这里现读一次配置没有代价。
+        let cfg = crate::config::get();
+        let (pw, ph) = (
+            cfg.camera.placeholder_width as i32,
+            cfg.camera.placeholder_height as i32,
+        );
         WaitForSingleObject(s.h_mutex, INFINITE);
-        write_header(s, PW, PH);
+        write_header(s, pw, ph);
         // 数据区清零（640*480*4 ≈ 1.2MB，只在挂上时做一次）
-        std::ptr::write_bytes(s.view.add(32), 0, (PW as usize) * (PH as usize) * 4);
+        std::ptr::write_bytes(s.view.add(32), 0, (pw as usize) * (ph as usize) * 4);
         let _ = ReleaseMutex(s.h_mutex);
         let _ = SetEvent(s.h_sent);
     }
@@ -339,6 +345,11 @@ mod windows_impl {
     /// 索要 → Want 不再触发 → 1 秒内判为释放。所以这里保留上报（v3.4.9）。
     pub fn engine(mailbox: FrameMailbox, tx: tokio::sync::mpsc::UnboundedSender<bool>) {
         info!("[Vcam] Unity Capture injection engine started");
+        // v3.8：无信号黑帧延时来自 config.json 的 camera.blackout_after_ms（默认 1500ms）。
+        // 只在这里读一次：主循环 8ms 一轮，每轮去取配置是白干活。
+        // Unity 通道这一路【不】用 camera.width/height —— 它的头部尺寸永远跟随手机
+        // 真实推流分辨率（历史上写死过尺寸，结果是"花屏、没有视频"，见文件顶部说明）。
+        let blackout_after = Duration::from_millis(crate::config::get().camera.blackout_after_ms);
         // 增量挂接状态：句柄跨重试累积，挂上后一直持有（与原版 C++ 行为一致）
         let mut sender = Sender::empty();
         let mut attached = false;
@@ -416,10 +427,10 @@ mod windows_impl {
                 }
             }
 
-            // —— 4. 手机停推 >1.5s → 覆盖黑帧（隐私：不把最后一帧一直挂着）——
+            // —— 4. 手机停推超过 camera.blackout_after_ms → 覆盖黑帧（隐私：不把最后一帧一直挂着）——
             if !blanked {
                 if let Some(t) = last_frame_at {
-                    if t.elapsed() >= Duration::from_millis(1500) {
+                    if t.elapsed() >= blackout_after {
                         let (w, h) = last_dims;
                         if w > 0 && h > 0 {
                             let black = black_rgba(w, h);

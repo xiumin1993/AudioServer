@@ -29,6 +29,12 @@ struct Args {
     /// 缺必需驱动时直接打印缺项并退出，不监听端口 —— 与 GUI 版行为一致。
     #[arg(long)]
     skip_env_check: bool,
+
+    /// 把 config.json 的**完整默认内容**打印到标准输出后立即退出（不监听端口、不检查驱动）。
+    /// 打包脚本用它的输出落成 `config.default.json`，这样"默认值"永远只有
+    /// src/config.rs 一处定义，不会出现文档和程序对不上的情况。
+    #[arg(long)]
+    print_default_config: bool,
 }
 
 #[tokio::main]
@@ -38,10 +44,17 @@ async fn main() -> Result<()> {
         .init();
 
     // CLI 版没有界面可点，语言由环境变量 / settings.txt / 系统语言决定（与 GUI 同一套优先级）
+    let args = Args::parse();
+
+    // "打印默认配置"要排在最前面：它只是给打包脚本用的纯输出，
+    // 既不该建 %APPDATA%\PCAssistant\config.json，也不该被驱动门禁拦住。
+    if args.print_default_config {
+        print!("{}", audioserver::config::default_json());
+        return Ok(());
+    }
+
     let (locale, locale_from) = audioserver::lang::apply_startup_locale();
     log::info!("[CLI] UI language = {locale} (from {locale_from})");
-
-    let args = Args::parse();
 
     // ── v3.5：启动环境门禁（只读检测，不写注册表、不装驱动）──
     if !args.skip_env_check {

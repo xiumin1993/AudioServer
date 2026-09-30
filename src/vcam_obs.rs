@@ -444,15 +444,24 @@ mod windows_impl {
 
     // ── 引擎主循环 ─────────────────────────────────────────────
 
-    /// 默认占位分辨率：应用先打开、手机还没推流时用它给干净黑帧
-    const DEFAULT_W: u32 = 960;
-    const DEFAULT_H: u32 = 720;
-
     pub fn engine(
         mailbox: crate::vcam::FrameMailbox,
         tx: tokio::sync::mpsc::UnboundedSender<bool>,
     ) {
         info!("[VcamObs] OBS Virtual Camera injection engine started");
+
+        // ── v3.8：分辨率 / 帧率 / 无信号黑帧延时来自 config.json 的 camera 段 ──
+        // 出厂默认还是原来的 960x720@30 与 1500ms，行为不变，只是现在能改了。
+        // 只在引擎启动时读一次：下面那个主循环 8ms 一轮，每轮去取配置纯属白干活。
+        let cam_cfg = crate::config::get().camera;
+        let (default_w, default_h) = (cam_cfg.width, cam_cfg.height);
+        let fps = cam_cfg.fps;
+        let blackout_after = Duration::from_millis(cam_cfg.blackout_after_ms);
+        info!(
+            "[VcamObs] config: {default_w}x{default_h}@{fps}fps, blackout {}ms",
+            cam_cfg.blackout_after_ms
+        );
+
         let mut q: Option<ObsQueue> = None;
         let mut q_size = (0u32, 0u32);
         let mut last_try = Instant::now() - Duration::from_secs(1);
@@ -477,18 +486,18 @@ mod windows_impl {
         let mut blanked = true; // 启动时是黑帧，无需再覆盖
 
         // ── 启动时立即创建默认共享内存 ──
-        // 不等手机推流、不等注册表——先建好 960×720 黑帧映射，
+        // 不等手机推流、不等注册表——先建好默认分辨率的黑帧映射，
         // 让 OBS Virtual Camera 设备立刻可见，应用才能打开它。
         // （否则陷入死锁：应用要设备存在才能打开 → 设备要应用打开才创建）
         {
-            let nq = unsafe { queue_create(DEFAULT_W, DEFAULT_H, 30) };
+            let nq = unsafe { queue_create(default_w, default_h, fps) };
             match nq {
                 Some(nq) => {
-                    let black = black_nv12(DEFAULT_W, DEFAULT_H);
+                    let black = black_nv12(default_w, default_h);
                     unsafe { queue_write(&nq, &black, timestamp_100ns()) };
-                    info!("[VcamObs] Initial black mapping created {DEFAULT_W}x{DEFAULT_H}");
+                    info!("[VcamObs] Initial black mapping created {default_w}x{default_h}");
                     q = Some(nq);
-                    q_size = (DEFAULT_W, DEFAULT_H);
+                    q_size = (default_w, default_h);
                 }
                 None => warn!(
                     "[VcamObs] Initial mapping creation failed (OBS running?), will retry"
@@ -551,7 +560,7 @@ mod windows_impl {
                         // 映射不存在 → 创建（500ms 限速重试）
                         if q.is_none() && last_try.elapsed() >= Duration::from_millis(500) {
                             last_try = Instant::now();
-                            let nq = unsafe { queue_create(out_w as u32, out_h as u32, 30) };
+                            let nq = unsafe { queue_create(out_w as u32, out_h as u32, fps) };
                             match nq {
                                 Some(nq) => {
                                     info!("[VcamObs] OBSVirtualCamVideo mapping created {out_w}x{out_h}");
@@ -596,22 +605,22 @@ mod windows_impl {
             {
                 // 映射丢失（可能被 OBS 本体抢占后释放）→ 重建默认黑帧
                 last_try = Instant::now();
-                if let Some(nq) = unsafe { queue_create(DEFAULT_W, DEFAULT_H, 30) } {
-                    let black = black_nv12(DEFAULT_W, DEFAULT_H);
+                if let Some(nq) = unsafe { queue_create(default_w, default_h, fps) } {
+                    let black = black_nv12(default_w, default_h);
                     unsafe { queue_write(&nq, &black, timestamp_100ns()) };
                     q = Some(nq);
-                    q_size = (DEFAULT_W, DEFAULT_H);
+                    q_size = (default_w, default_h);
                     q_created_at = Instant::now();
                     last_poll = Instant::now() - Duration::from_millis(300);
                     last_seen_handles = 0;
-                    info!("[VcamObs] Placeholder black mapping recreated {DEFAULT_W}x{DEFAULT_H}");
+                    info!("[VcamObs] Placeholder black mapping recreated {default_w}x{default_h}");
                 }
             }
 
-            // —— 3. 无信号保护：手机停推 >1.5s 就用黑帧盖掉旧画面 ——
+            // —— 3. 无信号保护：手机停推超过 camera.blackout_after_ms 就用黑帧盖掉旧画面 ——
             if let Some(qq) = q.as_ref() {
                 if let Some(t) = last_frame_at {
-                    if !blanked && t.elapsed() >= Duration::from_millis(1500) {
+                    if !blanked && t.elapsed() >= blackout_after {
                         let black = black_nv12(q_size.0, q_size.1);
                         unsafe { queue_write(qq, &black, timestamp_100ns()) };
                         blanked = true;

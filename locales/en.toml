@@ -130,6 +130,7 @@ lang_save_failed = "Could not save the config file ({error}) — the switch stil
 config_file = "CONFIG FILE"
 config_hint = "Every setting above is saved automatically to:\n{path}\nRestart the program so audio/hardware values take effect. Deleting\nthe file resets everything to defaults."
 config_missing = "No config directory available — this run uses built-in defaults only."
+log_path = "Log file: {path}"
 
 [log]
 runtime = "RUNTIME LOG"

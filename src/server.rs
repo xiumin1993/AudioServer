@@ -19,7 +19,7 @@ use crate::vcam_obs;
 #[cfg(windows)]
 use windows::Win32::Media::Audio::{
     eConsole, eRender, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
-    IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator,
+    DEVICE_STATE_ACTIVE, IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator,
     MMDeviceEnumerator,
 };
 #[cfg(windows)]
@@ -32,6 +32,10 @@ use windows::Win32::UI::Shell::PropertiesSystem::PROPERTYKEY;
 use windows::core::GUID;
 
 /// Server configuration
+///
+/// 界面上能改的就是这四个（v3.8 起它们的初值来自 config.json）。
+/// 其余运行参数（监听地址、Ping 间隔、统计间隔、设备名、虚拟摄像头分辨率…）
+/// 一律从 config.json 读，见 `crate::config`。
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub port: u16,
@@ -327,6 +331,8 @@ pub async fn run_server(
     });
 
     // v3：启动虚拟麦克风注入引擎（把 mic_queue 里的上行 PCM 持续写入 CABLE Input）
+    // 手机还没上报采样率之前，上行默认速率取 config.json 的 mic.uplink_sample_rate
+    mic_out::apply_startup_rate();
     mic_out::spawn_mic_output(client_manager.mic_queue.clone(), event_tx.clone());
 
     // v3.1：启动"应用占用麦克风"检测线程。检测结果通过 std 通道进入 tokio，
@@ -344,13 +350,28 @@ pub async fn run_server(
 
     // v3.4：启动 Unity Capture 虚拟摄像头注入引擎（消费 cam_mailbox 里的 JPEG 帧）。
     // 引擎线程通过 Want 事件判断"有应用在观看摄像头"，翻转时经通道回传。
+    // v3.8：两路引擎各由 config.json 的一个开关控制（默认都开，因为不同应用只认
+    // 其中一路：浏览器认 OBS，钉钉一类桌面软件认 Unity）。关掉一路 = 那路应用就
+    // 看不到手机摄像头，这是有意的取舍，不是 bug。
+    let cam_cfg = crate::config::get().camera;
     let (cam_tx, mut cam_rx) = mpsc::unbounded_channel::<bool>();
-    vcam::spawn_vcam(client_manager.cam_mailbox.clone(), cam_tx);
+    if cam_cfg.unity_enabled {
+        vcam::spawn_vcam(client_manager.cam_mailbox.clone(), cam_tx.clone());
+    } else {
+        info!("[Server] camera.unity_enabled = false → 不启动 Unity Capture 通道");
+    }
 
     // v3.4 双通道：再开一条 OBS Virtual Camera 注入线（浏览器/新框架应用只认它）。
     // OBS 协议没有 Want 事件，用隐私监控注册表判断"有应用在访问摄像头"。
     let (cam_obs_tx, mut cam_obs_rx) = mpsc::unbounded_channel::<bool>();
-    vcam_obs::spawn_vcam_obs(client_manager.cam_mailbox_obs.clone(), cam_obs_tx);
+    if cam_cfg.obs_enabled {
+        vcam_obs::spawn_vcam_obs(client_manager.cam_mailbox_obs.clone(), cam_obs_tx.clone());
+    } else {
+        info!("[Server] camera.obs_enabled = false → 不启动 OBS Virtual Camera 通道");
+    }
+    // 没启动的那一路也必须留一个发送端在这里：通道一旦全关，下面 select! 的对应
+    // 分支会立刻拿到 None，两路都关时整个合并循环还会直接 break。
+    let _cam_tx_keepalive = (cam_tx, cam_obs_tx);
 
     // 两路活跃信号在这里合并（OR 语义）：任一虚拟摄像头被观看 → 唤醒手机开相机；
     // 两路都释放 → 手机立刻关相机回待命。翻转时 ① 推 GUI 事件 ② 广播 cam_state
@@ -398,12 +419,16 @@ pub async fn run_server(
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 
     // Start WebSocket server
-    let addr = format!("0.0.0.0:{}", config.port);
+    // 监听地址来自 config.json 的 network.bind，默认 "0.0.0.0" = 所有网卡
+    // （手机要从局域网连进来，只能监听回环就连不上）。改成具体网卡地址可以把
+    // 服务限制在某个网段，例如 "127.0.0.1" 只允许 USB 有线（adb forward）连进来。
+    let bind = crate::config::get().network.bind;
+    let addr = format!("{}:{}", bind, config.port);
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => {
             event_tx.send(ServerEvent::Log(format!(
-                "WebSocket server listening on port {}",
-                config.port
+                "WebSocket server listening on {}:{}",
+                bind, config.port
             ))).ok();
             event_tx.send(ServerEvent::StatusChanged(ServerStatus::Running)).ok();
             l
@@ -471,43 +496,25 @@ pub async fn run_server(
     event_tx.send(ServerEvent::StatusChanged(ServerStatus::Stopped)).ok();
 }
 
-/// Start audio capture using WASAPI loopback (Windows only)
+/// 通过属性存储获取设备友好名称（如 "Speakers (Realtek Audio)"）
+///
+/// PKEY_Device_FriendlyName 的 GUID 值（Windows SDK 标准定义）
 #[cfg(windows)]
-fn start_audio_capture(
-    _config: ServerConfig,
-    client_manager: Arc<ClientManager>,
-    event_tx: std::sync::mpsc::Sender<ServerEvent>,
-) -> Result<()> {
-    use windows::Win32::System::Com::CoTaskMemFree;
+const PKEY_DEVICE_FRIENDLY_NAME: PROPERTYKEY = PROPERTYKEY {
+    fmtid: GUID::from_values(
+        0xa45c254e, 0xdf1c, 0x4efd,
+        [0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0],
+    ),
+    pid: 14,
+};
 
-    // Initialize COM for this thread
-    let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
-    if hr.is_err() {
-        anyhow::bail!("CoInitializeEx failed: {:?}", hr);
-    }
-
-    // Create device enumerator
-    let enumerator: IMMDeviceEnumerator = unsafe {
-        CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?
-    };
-
-    // Get default render (output) device — this is what we loopback from
-    // GetDefaultAudioEndpoint(dataflow: EDataFlow, role: ERole)
-    let device: IMMDevice = unsafe {
-        enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?
-    };
-
-    // 通过属性存储获取设备友好名称（如 "Speakers (Realtek Audio)"）
-    // PKEY_Device_FriendlyName 的 GUID 值（Windows SDK 标准定义）
-    const PKEY_DEVICE_FRIENDLY_NAME: PROPERTYKEY = PROPERTYKEY {
-        fmtid: GUID::from_values(
-            0xa45c254e, 0xdf1c, 0x4efd,
-            [0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0],
-        ),
-        pid: 14,
-    };
-
-    let device_name = unsafe {
+/// 读一台设备的友好名（与 mic_out.rs 同一手法：直接按 PROPVARIANT 内存布局取值）
+///
+/// 单独抽出来是因为 v3.8 起扬声器回路（loopback）也支持按名字选设备了，
+/// 选设备必须先能读到名字。
+#[cfg(windows)]
+fn device_friendly_name(device: &IMMDevice) -> String {
+    unsafe {
         match device.OpenPropertyStore(STGM_READ) {
             Ok(store) => {
                 match store.GetValue(&PKEY_DEVICE_FRIENDLY_NAME) {
@@ -536,8 +543,93 @@ fn start_audio_capture(
             }
             Err(_) => "Unknown".to_string(),
         }
+    }
+}
+
+/// 在"当前可用的播放设备"里按友好名模糊找一台（大小写不敏感、子串匹配）
+///
+/// 找不到（或枚举失败）就返回 None，由调用方退回系统默认播放设备——
+/// 绝不因为配置里写错一个名字就让程序起不来。
+#[cfg(windows)]
+unsafe fn find_render_device_by_name(
+    enumerator: &IMMDeviceEnumerator,
+    hint: &str,
+) -> Option<IMMDevice> {
+    let collection = match enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("[Speaker] EnumAudioEndpoints(eRender) failed: {e:?}");
+            return None;
+        }
     };
-    info!("Using audio device: {}", device_name);
+    let count = match collection.GetCount() {
+        Ok(n) => n,
+        Err(e) => {
+            warn!("[Speaker] device collection count failed: {e:?}");
+            return None;
+        }
+    };
+    let needle = hint.to_uppercase();
+    for i in 0..count {
+        let device = match collection.Item(i) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        if device_friendly_name(&device).to_uppercase().contains(&needle) {
+            return Some(device);
+        }
+    }
+    None
+}
+
+/// Start audio capture using WASAPI loopback (Windows only)
+#[cfg(windows)]
+fn start_audio_capture(
+    _config: ServerConfig,
+    client_manager: Arc<ClientManager>,
+    event_tx: std::sync::mpsc::Sender<ServerEvent>,
+) -> Result<()> {
+    use windows::Win32::System::Com::CoTaskMemFree;
+
+    // Initialize COM for this thread
+    let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    if hr.is_err() {
+        anyhow::bail!("CoInitializeEx failed: {:?}", hr);
+    }
+
+    // Create device enumerator
+    let enumerator: IMMDeviceEnumerator = unsafe {
+        CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?
+    };
+
+    // Get default render (output) device — this is what we loopback from
+    // GetDefaultAudioEndpoint(dataflow: EDataFlow, role: ERole)
+    //
+    // v3.8：config.json 的 speaker.capture_device_hint 可以指定"从哪台播放设备取回路"。
+    //   · 留空（默认）→ 和以前完全一样，用系统默认播放设备；
+    //   · 填了名字（如 "Realtek" / "CABLE"）→ 在可用播放设备里模糊找第一台；
+    //   · 写了但没找到 → 记一条 warn 后仍退回默认播放设备（不会因为笔误起不来）。
+    let hint = crate::config::get().speaker.capture_device_hint;
+    let hint = hint.trim();
+    // 日志里要说清楚这台设备到底是怎么来的，否则排障时会误以为 config 生效了
+    let mut device_source = if hint.is_empty() { "系统默认播放设备" } else { "config 指定" };
+    let device: IMMDevice = if hint.is_empty() {
+        unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole)? }
+    } else {
+        match unsafe { find_render_device_by_name(&enumerator, hint) } {
+            Some(d) => d,
+            None => {
+                warn!(
+                    "[Speaker] capture_device_hint '{hint}' 没匹配到播放设备 → 改用系统默认播放设备"
+                );
+                device_source = "系统默认播放设备（hint 未命中）";
+                unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole)? }
+            }
+        }
+    };
+
+    let device_name = device_friendly_name(&device);
+    info!("Using audio device: {} ({})", device_name, device_source);
     event_tx.send(ServerEvent::Log(format!("Audio device: {}", device_name))).ok();
 
     // Activate IAudioClient on the device
@@ -933,13 +1025,20 @@ async fn handle_connection(
         }
     }
 
+    // v3.8：心跳 / 统计间隔从 config.json 取。每个连接建立时读一次内存里那份配置，
+    // 绝不在循环里读 —— 配置改了下一次连接才生效，这是有意的（连接中途改节奏没意义）。
+    let run_cfg = crate::config::get();
+    let ping_ms = run_cfg.network.ping_interval_ms;
+    let stat_ms = run_cfg.diagnostics.stat_interval_ms;
+
     // Downlink send task: loopback audio → WebSocket + periodic ping for keepalive
     // 客户端被移出广播表时 audio_rx 自然关闭，任务退出（Mic 模式即走此路径停止下行）
     let sink_send = ws_sink.clone();
     let key_send = client_key.clone();
     let send_task = tokio::spawn(async move {
-        // v3.4.5：WiFi 稳定性 —— 每 5 秒发一次 Ping，检测连接是否存活
-        let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        // v3.4.5：WiFi 稳定性 —— 定期发 Ping，检测连接是否存活（默认 5 秒，
+        // 可在 config.json 的 network.ping_interval_ms 里改）
+        let mut ping_interval = tokio::time::interval(std::time::Duration::from_millis(ping_ms));
         ping_interval.tick().await; // 跳过第一次立即触发的 tick
 
         loop {
@@ -1162,9 +1261,9 @@ async fn handle_connection(
                             if let Some((w, h)) = jpeg_dims(&data[4..]) {
                                 cam_frame_dims = (w, h);
                             }
-                            // 每秒推一次摄像头链路统计（附带最新一帧给 GUI 预览）
+                            // 按 diagnostics.stat_interval_ms（默认 1000ms）推一次摄像头链路统计
                             let elapsed = cam_window_start.elapsed();
-                            if elapsed.as_millis() >= 1000 {
+                            if elapsed.as_millis() >= stat_ms as u128 {
                                 let secs = elapsed.as_millis() as f64 / 1000.0;
                                 let kbps = (cam_bytes_window as f64 * 8.0 / 1000.0 / secs) as u32;
                                 let fps = (cam_packets as f64 / secs) as u32;
@@ -1205,9 +1304,9 @@ async fn handle_connection(
                         if mic_packets % 5 == 0 {
                             event_tx_recv.send(ServerEvent::MicLevel(level)).ok();
                         }
-                        // 每秒推一次链路统计
+                        // 按 stat_interval_ms（默认 1000ms）推一次链路统计
                         let elapsed = window_start.elapsed();
-                        if elapsed.as_millis() >= 1000 {
+                        if elapsed.as_millis() >= stat_ms as u128 {
                             let secs = elapsed.as_millis() as f64 / 1000.0;
                             let kbps = (mic_bytes_window as f64 * 8.0 / 1000.0 / secs) as u32;
                             let interval_ms =

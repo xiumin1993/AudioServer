@@ -23,11 +23,16 @@
 //   - 像素格式 NV12（BT.601 limited range），所以我们把 JPEG 解出来的
 //     RGB24 现场转成 NV12 再写入
 //
-// "有没有应用正在看摄像头"的检测：OBS 协议里没有 Unity 那样的 Want 事件，
-//   改用 Windows 隐私监控注册表 CapabilityAccessManager：
-//   这台电脑没有物理摄像头，所以 webcam 节点下任何进程条目
-//   LastUsedTimeStop == 0（正在访问）→ 一定是有应用打开了虚拟摄像头
-//   → 服务器据此唤醒手机开相机；应用关闭 → 立刻回待命（隐私语义不变）。
+// "有没有应用正在看摄像头"的检测：OBS 协议本身没有 Unity 那样的 Want 事件
+//   （read_idx 是生产者可自己写的，消费者不回写任何状态），
+//   改用【命名 Section 对象的内核句柄计数】：
+//   OBS Virtual Camera 是进程内 DirectShow 滤镜——应用打开摄像头时，
+//   virtualcam-module.dll 被加载进那个应用自己的进程，在其中执行
+//   OpenFileMappingW("OBSVirtualCamVideo")，给共享内存对象增加一个句柄。
+//     句柄数 == 1 → 只有我们（生产者）持有 → 没有应用在观看
+//     句柄数 >= 2 → 至少一个应用进程打开了映射 → 有应用正在用摄像头
+//   之前用隐私注册表 CapabilityAccessManager 检测是无效的：它只跟踪
+//   UWP / Media Foundation 框架的摄像头访问，对 DirectShow 滤镜完全不记录。
 
 use log::info;
 
@@ -65,19 +70,11 @@ mod windows_impl {
     };
     use windows::Win32::System::Memory::{
         CreateFileMappingW, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile,
-        MEMORY_MAPPED_VIEW_ADDRESS, FILE_MAP_ALL_ACCESS, FILE_MAP_READ, PAGE_READWRITE,
-    };
-    use windows::Win32::System::Registry::{
-        RegCloseKey, RegEnumKeyW, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER,
-        KEY_READ, REG_QWORD,
+        MEMORY_MAPPED_VIEW_ADDRESS, FILE_MAP_ALL_ACCESS, PAGE_READWRITE,
     };
 
     /// 与 OBS 源码一致的段名（UTF-16 命名共享内存）
     const VIDEO_NAME: &str = "OBSVirtualCamVideo";
-
-    /// 隐私监控注册表：摄像头（webcam）访问记录根节点
-    const CONSENT_PATH: &str =
-        "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\webcam";
 
     /// queue_header 的 sizeof（3×u32 + offsets[3] + type + cx + cy + pad + u64 + reserved[8]）
     const HEADER_SIZE: usize = 80;
@@ -141,14 +138,15 @@ mod windows_impl {
     }
 
     /// 创建（或重建）OBS 虚拟摄像头共享内存。
-    /// 返回 None = 已被占用（OBS 本体在跑）或系统拒绝，稍后由引擎重试。
+    /// 返回 None = 系统拒绝，稍后由引擎重试。
     unsafe fn queue_create(cx: u32, cy: u32, fps: u32) -> Option<ObsQueue> {
         let name = wstr(VIDEO_NAME);
-        // 先探测是否已存在：OBS 源码同款防冲突（fail if already in use）
-        let existing = OpenFileMappingW(FILE_MAP_READ.0, false, PCWSTR(name.as_ptr()));
+        // 先探测是否已存在
+        let existing = OpenFileMappingW(FILE_MAP_ALL_ACCESS.0, false, PCWSTR(name.as_ptr()));
         if let Ok(h) = existing {
-            let _ = CloseHandle(h);
-            return None;
+            // 映射已存在（可能是上次会话残留，消费者还持有）→ 接管它
+            info!("[VcamObs] Mapping already exists, taking over (old session residue)");
+            return queue_open_existing(h, cx, cy, fps);
         }
 
         let (size, offsets) = layout(cx, cy);
@@ -165,10 +163,10 @@ mod windows_impl {
             Ok(h) => h,
             Err(_) => return None,
         };
-        // 名字竞争：另一进程刚好抢先建了同名段 → 放弃本轮
+        // 名字竞争：另一进程刚好抢先建了同名段 → 尝试接管
         if GetLastError() == ERROR_ALREADY_EXISTS {
-            let _ = CloseHandle(h_map);
-            return None;
+            info!("[VcamObs] Mapping created but already exists, taking over");
+            return queue_open_existing(h_map, cx, cy, fps);
         }
         let view = MapViewOfFile(h_map, FILE_MAP_ALL_ACCESS, 0, 0, 0).Value as *mut u8;
         if view.is_null() {
@@ -188,6 +186,54 @@ mod windows_impl {
         std::ptr::write_unaligned(view.add(40) as *mut u64, interval);
 
         Some(ObsQueue { h_map, view, cx, cy, offsets })
+    }
+
+    /// 接管已存在的共享内存（上次会话残留或 OBS 本体创建）。
+    /// 读取头部获取分辨率，重置状态为 STARTING，然后可写入新帧。
+    unsafe fn queue_open_existing(h_map: HANDLE, cx: u32, cy: u32, fps: u32) -> Option<ObsQueue> {
+        let view = MapViewOfFile(h_map, FILE_MAP_ALL_ACCESS, 0, 0, 0).Value as *mut u8;
+        if view.is_null() {
+            let _ = CloseHandle(h_map);
+            warn!("[VcamObs] Failed to map existing shared memory");
+            return None;
+        }
+
+        // 读取头部：分辨率和槽偏移
+        let existing_cx = std::ptr::read_unaligned(view.add(28) as *const u32);
+        let existing_cy = std::ptr::read_unaligned(view.add(32) as *const u32);
+        let offsets = [
+            std::ptr::read_unaligned(view.add(12) as *const u32) as usize,
+            std::ptr::read_unaligned(view.add(16) as *const u32) as usize,
+            std::ptr::read_unaligned(view.add(20) as *const u32) as usize,
+        ];
+
+        // 如果分辨率不匹配，我们需要重建（但消费者可能还持有旧映射）
+        // 这里先接受旧分辨率，后续引擎检测到帧分辨率变化时会尝试重建
+        let (use_cx, use_cy) = if existing_cx > 0 && existing_cy > 0 {
+            (existing_cx, existing_cy)
+        } else {
+            (cx, cy)
+        };
+
+        // 更新帧率间隔
+        let interval = (10_000_000u64 / (fps.max(1) as u64)).max(1);
+        std::ptr::write_unaligned(view.add(40) as *mut u64, interval);
+
+        // 重置状态为 STARTING（告诉消费者"生产者重新上线了"）
+        std::ptr::write_unaligned(view.add(8) as *mut u32, STATE_STARTING);
+
+        info!(
+            "[VcamObs] Took over existing mapping at {}x{} (requested {}x{})",
+            use_cx, use_cy, cx, cy
+        );
+
+        Some(ObsQueue {
+            h_map,
+            view,
+            cx: use_cx,
+            cy: use_cy,
+            offsets,
+        })
     }
 
     /// 写一帧 NV12（逐行对应 video_queue_write）
@@ -255,6 +301,28 @@ mod windows_impl {
         out
     }
 
+    /// RGB24 最近邻缩放（用于帧分辨率与映射不匹配时）
+    fn scale_rgb_nearest(rgb: &[u8], src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> Vec<u8> {
+        let mut out = vec![0u8; dst_w * dst_h * 3];
+        let x_ratio = src_w as f64 / dst_w as f64;
+        let y_ratio = src_h as f64 / dst_h as f64;
+
+        for dy in 0..dst_h {
+            let sy = (dy as f64 * y_ratio) as usize;
+            let sy = sy.min(src_h - 1);
+            for dx in 0..dst_w {
+                let sx = (dx as f64 * x_ratio) as usize;
+                let sx = sx.min(src_w - 1);
+                let src_idx = (sy * src_w + sx) * 3;
+                let dst_idx = (dy * dst_w + dx) * 3;
+                out[dst_idx] = rgb[src_idx];
+                out[dst_idx + 1] = rgb[src_idx + 1];
+                out[dst_idx + 2] = rgb[src_idx + 2];
+            }
+        }
+        out
+    }
+
     /// 黑帧 NV12（Y=16、UV=128）：应用刚打开、手机还没出图时给它干净信号
     fn black_nv12(w: u32, h: u32) -> Vec<u8> {
         let n = (w as usize) * (h as usize);
@@ -273,66 +341,105 @@ mod windows_impl {
             .unwrap_or(0)
     }
 
-    // ── 隐私注册表：判断"有没有应用正在使用摄像头" ──────────────
+    // ── 消费者检测：全系统句柄表扫描 ────────────────────────────
+    //
+    // 已实测验证（src/bin/queue_handle_probe.rs）：
+    //   只有生产者 → 1；另一进程 OpenFileMapping 后 → 2；其退出 → 回到 1。
+    //   单次扫描 10.8 万条句柄耗时 21~53ms，所以轮询间隔取 1 秒。
+    //
+    // 注：NtQueryObject 的 ObjectHandleInformation(class 2) 对 Section 对象
+    //   不可用（返回 STATUS_INFO_LENGTH_MISMATCH），必须走 SystemExtended
+    //   HandleInformation 快照，这是 Sysinternals Handle.exe 的同款算法。
 
-    /// 读一个应用条目的 LastUsedTimeStop（REG_QWORD）。0 = 正在访问中
-    unsafe fn key_is_active(h: HKEY) -> bool {
-        let name = wstr("LastUsedTimeStop");
-        let mut buf: u64 = u64::MAX;
-        let mut cb: u32 = 8;
-        let mut kind = REG_QWORD;
-        let r = RegQueryValueExW(
-            h,
-            PCWSTR(name.as_ptr()),
-            None,
-            Some(&mut kind),
-            Some(&mut buf as *mut u64 as *mut u8),
-            Some(&mut cb),
-        );
-        r.is_ok() && kind == REG_QWORD && buf == 0
+    /// SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX（ntexapi.h，40 字节）
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct HandleEntryEx {
+        object_id: *mut core::ffi::c_void,
+        unique_process_id: usize,
+        handle_value: usize,
+        granted_access: u32,
+        creator_back_trace_index: u16,
+        object_type_index: u16,
+        handle_attributes: u32,
+        reserved: u32,
     }
 
-    /// 递归枚举子键（深度限制 2 层：webcam\<应用> 与 webcam\NonPackaged\<exe 路径>）
-    unsafe fn scan_subkeys(h_parent: HKEY, depth: u32) -> bool {
-        if depth == 0 {
-            return false;
-        }
-        let mut idx = 0u32;
+    /// SYSTEM_INFORMATION_CLASS::SystemExtendedHandleInformation = 64
+    const SYS_EXT_HANDLE_INFO: u32 = 64;
+    /// STATUS_INFO_LENGTH_MISMATCH：缓冲区不够，按 ReturnLength 重试
+    const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC0000004u32 as i32;
+
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtQuerySystemInformation(
+            class: u32,
+            buffer: *mut core::ffi::c_void,
+            length: u32,
+            return_length: *mut u32,
+        ) -> i32;
+    }
+
+    /// 全系统范围内持有该映射的句柄数。1 = 只有生产者自己，>= 2 = 有应用打开了虚拟摄像头。
+    /// 返回 None 表示查询失败（调用方应保持上一次判定，避免状态抖动）。
+    unsafe fn mapping_handle_count(h: HANDLE) -> Option<u32> {
+        let my_pid = std::process::id() as usize;
+        let my_handle = h.0 as usize;
+        let stride = std::mem::size_of::<HandleEntryEx>();
+        let base = 16usize; // NumberOfHandles(usize) + Reserved(usize)
+        let mut size = 4usize << 20;
+
         loop {
-            let mut buf = [0u16; 512];
-            let st = RegEnumKeyW(h_parent, idx, Some(&mut buf));
-            if !st.is_ok() {
-                break; // ERROR_NO_MORE_ITEMS 或出错 → 结束
+            let mut buf = vec![0u8; size];
+            let mut ret: u32 = 0;
+            let st = NtQuerySystemInformation(
+                SYS_EXT_HANDLE_INFO,
+                buf.as_mut_ptr() as *mut core::ffi::c_void,
+                size as u32,
+                &mut ret,
+            );
+            if st == STATUS_INFO_LENGTH_MISMATCH {
+                size = (ret as usize) + (1 << 20);
+                if size > (256usize << 20) {
+                    return None; // 异常膨胀，放弃本轮
+                }
+                continue;
             }
-            let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-            let sub = String::from_utf16_lossy(&buf[..end]);
-            let subw = wstr(&sub);
-            let mut h_sub = HKEY(std::ptr::null_mut());
-            if RegOpenKeyExW(h_parent, PCWSTR(subw.as_ptr()), 0, KEY_READ, &mut h_sub).is_ok() {
-                let hit = key_is_active(h_sub) || scan_subkeys(h_sub, depth - 1);
-                let _ = RegCloseKey(h_sub);
-                if hit {
-                    return true;
+            if st != 0 {
+                return None;
+            }
+
+            let n = usize::from_le_bytes(buf[0..8].try_into().ok()?);
+            if base + n * stride > buf.len() {
+                return None; // 快照被截断
+            }
+
+            // —— 第一趟：找到我们自己那条句柄，拿到 Section 的内核对象地址 ——
+            let mut obj: usize = 0;
+            for i in 0..n {
+                let e: HandleEntryEx =
+                    std::ptr::read_unaligned(buf.as_ptr().add(base + i * stride) as *const _);
+                if e.unique_process_id == my_pid && e.handle_value == my_handle {
+                    obj = e.object_id as usize;
+                    break;
                 }
             }
-            idx += 1;
-        }
-        false
-    }
+            if obj == 0 {
+                return None;
+            }
 
-    /// 摄像头是否正被任何进程访问（这台电脑没有物理摄像头，
-    /// 所以答案等价于"有应用正在看我们的虚拟摄像头"）
-    unsafe fn webcam_access_active() -> bool {
-        let path = wstr(CONSENT_PATH);
-        let mut h = HKEY(std::ptr::null_mut());
-        if !RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(path.as_ptr()), 0, KEY_READ, &mut h).is_ok() {
-            info!("[VcamObs] Failed to open webcam consent registry key");
-            return false;
+            // —— 第二趟：统计全系统指向同一对象的句柄数 ——
+            // 必须分两趟：消费者可能比我们更早入表，单趟会在找到 obj 之前漏数。
+            let mut count = 0u32;
+            for i in 0..n {
+                let e: HandleEntryEx =
+                    std::ptr::read_unaligned(buf.as_ptr().add(base + i * stride) as *const _);
+                if e.object_id as usize == obj {
+                    count += 1;
+                }
+            }
+            return Some(count);
         }
-        let hit = scan_subkeys(h, 2);
-        let _ = RegCloseKey(h);
-        info!("[VcamObs] webcam_access_active() = {}", hit);
-        hit
     }
 
     // ── 引擎主循环 ─────────────────────────────────────────────
@@ -349,23 +456,77 @@ mod windows_impl {
         let mut q: Option<ObsQueue> = None;
         let mut q_size = (0u32, 0u32);
         let mut last_try = Instant::now() - Duration::from_secs(1);
-        let mut last_poll = Instant::now() - Duration::from_secs(1);
-        let mut active = false;
         let mut frames_written: u64 = 0;
+        let mut frames_dropped: u64 = 0;
+        let mut first_frame_logged = false;
+
+        // —— 消费者（应用）活跃检测状态 ——
+        // 每次扫描全系统句柄表约 20~50ms，所以 1 秒轮一次足够（应用开/关摄像头
+        // 是秒级人工操作，不需要更灵敏）
+        let mut last_poll = Instant::now() - Duration::from_secs(2);
+        let mut active = false;
+        // 刚创建映射时消费者还没来得及 OpenFileMapping，给 2s 宽限期避免误报释放
+        let mut q_created_at = Instant::now();
+        let mut last_seen_handles = 0u32;
+
+        // —— 无信号保护 ——
+        // 手机断推后，共享内存里会永远留着【断线前的最后一帧】。OBS 滤镜把它
+        // 当作实时画面持续送给应用 → 视频会议里显示一张"过期的照片"（既错又涉隐私）。
+        // 所以超过 1.5 秒没有新帧就主动写一帧纯黑覆盖掉它。
+        let mut last_frame_at: Option<Instant> = None;
+        let mut blanked = true; // 启动时是黑帧，无需再覆盖
+
+        // ── 启动时立即创建默认共享内存 ──
+        // 不等手机推流、不等注册表——先建好 960×720 黑帧映射，
+        // 让 OBS Virtual Camera 设备立刻可见，应用才能打开它。
+        // （否则陷入死锁：应用要设备存在才能打开 → 设备要应用打开才创建）
+        {
+            let nq = unsafe { queue_create(DEFAULT_W, DEFAULT_H, 30) };
+            match nq {
+                Some(nq) => {
+                    let black = black_nv12(DEFAULT_W, DEFAULT_H);
+                    unsafe { queue_write(&nq, &black, timestamp_100ns()) };
+                    info!("[VcamObs] Initial black mapping created {DEFAULT_W}x{DEFAULT_H}");
+                    q = Some(nq);
+                    q_size = (DEFAULT_W, DEFAULT_H);
+                }
+                None => warn!(
+                    "[VcamObs] Initial mapping creation failed (OBS running?), will retry"
+                ),
+            }
+        }
 
         loop {
-            // —— 1. 每 500ms 查一次隐私注册表 → 活跃状态上报（cam_state 第二信号源）——
-            if last_poll.elapsed() >= Duration::from_millis(500) {
+            // —— 1. 消费者活跃检测：全系统句柄表扫描（1 秒一次）——
+            if q.is_some() && last_poll.elapsed() >= Duration::from_secs(1) {
                 last_poll = Instant::now();
-                let now_active = unsafe { webcam_access_active() };
-                if now_active != active {
-                    active = now_active;
-                    info!(
-                        "[VcamObs] Camera {} (via OBS vcam registry poll)",
-                        if active { "is being watched" } else { "released" }
-                    );
-                    tx.send(active).ok();
+                match unsafe { mapping_handle_count(q.as_ref().unwrap().h_map) } {
+                    Some(count) => {
+                        if count != last_seen_handles {
+                            info!("[VcamObs] Virtual camera mapping handle count: {count}");
+                            last_seen_handles = count;
+                        }
+                        // 新建映射后的宽限期内不判定"释放"（消费者可能刚打开还没建句柄）
+                        let settled = q_created_at.elapsed() >= Duration::from_secs(2);
+                        let now_active = count >= 2;
+                        if now_active != active && (now_active || settled) {
+                            active = now_active;
+                            info!(
+                                "[VcamObs] OBS camera {}",
+                                if active { "is being watched by an app" } else { "released by all apps" }
+                            );
+                            tx.send(active).ok();
+                        }
+                    }
+                    // 查询失败：保持上一次判定，不抖动状态
+                    None => warn!("[VcamObs] handle scan failed, keeping previous state"),
                 }
+            }
+            // 映射丢失 → 无法检测，若之前是活跃状态则报释放
+            if q.is_none() && active {
+                active = false;
+                info!("[VcamObs] OBS camera released (mapping gone)");
+                tx.send(false).ok();
             }
 
             // —— 2. 取最新帧：解码 → RGB24 → NV12 → 写入 OBS 共享内存 ——
@@ -373,52 +534,89 @@ mod windows_impl {
             if let Some(jpeg) = frame {
                 match decode_jpeg_to_rgb(&jpeg) {
                     Ok((rgb, w, h)) => {
-                        // 映射不存在或分辨率变了 → 重建（500ms 限速重试）
-                        if (q.is_none() || q_size != (w, h))
-                            && last_try.elapsed() >= Duration::from_millis(500)
-                        {
+                        if !first_frame_logged {
+                            first_frame_logged = true;
+                            info!("[VcamObs] First JPEG from phone: {}x{}, mapping is {}x{}",
+                                w, h, q_size.0, q_size.1);
+                        }
+
+                        // 分辨率变了 → 缩放到映射分辨率（不丢弃映射，避免卡死）
+                        let (rgb_out, out_w, out_h) = if q.is_some() && (w as u32, h as u32) != q_size {
+                            let scaled = scale_rgb_nearest(&rgb, w as usize, h as usize, q_size.0 as usize, q_size.1 as usize);
+                            (scaled, q_size.0 as usize, q_size.1 as usize)
+                        } else {
+                            (rgb, w as usize, h as usize)
+                        };
+
+                        // 映射不存在 → 创建（500ms 限速重试）
+                        if q.is_none() && last_try.elapsed() >= Duration::from_millis(500) {
                             last_try = Instant::now();
-                            let nq = unsafe { queue_create(w, h, 30) };
+                            let nq = unsafe { queue_create(out_w as u32, out_h as u32, 30) };
                             match nq {
                                 Some(nq) => {
-                                    if q.is_some() {
-                                        info!("[VcamObs] Mapping recreated at {w}x{h}");
-                                    } else {
-                                        info!("[VcamObs] OBSVirtualCamVideo mapping created {w}x{h}");
-                                    }
+                                    info!("[VcamObs] OBSVirtualCamVideo mapping created {out_w}x{out_h}");
                                     q = Some(nq);
-                                    q_size = (w, h);
+                                    q_size = (out_w as u32, out_h as u32);
+                                    // 新映射：重置检测基线，句柄数从"只有我们"重新开始数
+                                    q_created_at = Instant::now();
+                                    last_poll = Instant::now() - Duration::from_millis(300);
+                                    last_seen_handles = 0;
                                 }
-                                None => warn!(
-                                    "[VcamObs] create mapping failed (OBS 本体占用或权限问题)，稍后重试"
-                                ),
+                                None => {
+                                    frames_dropped += 1;
+                                    if frames_dropped % 60 == 1 {
+                                        warn!(
+                                            "[VcamObs] mapping at {}x{} unavailable ({} frames dropped) — consumer holding old mapping?",
+                                            out_w, out_h, frames_dropped
+                                        );
+                                    }
+                                }
                             }
                         }
+
                         if let Some(qq) = q.as_ref() {
-                            if (w, h) == q_size {
-                                let nv12 = rgb_to_nv12(&rgb, w as usize, h as usize);
-                                unsafe { queue_write(qq, &nv12, timestamp_100ns()) };
-                                frames_written += 1;
-                                if frames_written == 1 {
-                                    info!("[VcamObs] First frame written to OBS virtual camera");
-                                }
+                            let nv12 = rgb_to_nv12(&rgb_out, out_w, out_h);
+                            unsafe { queue_write(qq, &nv12, timestamp_100ns()) };
+                            frames_written += 1;
+                            // 收到真实画面：记下时刻，撤销黑帧标记
+                            last_frame_at = Some(Instant::now());
+                            blanked = false;
+                            if frames_written == 1 {
+                                info!("[VcamObs] First frame written to OBS virtual camera at {}x{}", out_w, out_h);
                             }
+                        } else if q.is_none() && q_size == (0, 0) {
+                            // waiting for mapping creation
+                            frames_dropped += 1;
                         }
                     }
                     Err(e) => warn!("[VcamObs] JPEG decode failed: {e}"),
                 }
-            } else if active && q.is_none()
+            } else if q.is_none()
                 && last_try.elapsed() >= Duration::from_millis(500)
             {
-                // 有应用在等画面、但手机还没推流：先建默认黑帧映射，
-                // 让应用的采集管线能正常协商分辨率，不至于报错关闭摄像头
+                // 映射丢失（可能被 OBS 本体抢占后释放）→ 重建默认黑帧
                 last_try = Instant::now();
                 if let Some(nq) = unsafe { queue_create(DEFAULT_W, DEFAULT_H, 30) } {
                     let black = black_nv12(DEFAULT_W, DEFAULT_H);
                     unsafe { queue_write(&nq, &black, timestamp_100ns()) };
                     q = Some(nq);
                     q_size = (DEFAULT_W, DEFAULT_H);
-                    info!("[VcamObs] Placeholder black mapping created {DEFAULT_W}x{DEFAULT_H}");
+                    q_created_at = Instant::now();
+                    last_poll = Instant::now() - Duration::from_millis(300);
+                    last_seen_handles = 0;
+                    info!("[VcamObs] Placeholder black mapping recreated {DEFAULT_W}x{DEFAULT_H}");
+                }
+            }
+
+            // —— 3. 无信号保护：手机停推 >1.5s 就用黑帧盖掉旧画面 ——
+            if let Some(qq) = q.as_ref() {
+                if let Some(t) = last_frame_at {
+                    if !blanked && t.elapsed() >= Duration::from_millis(1500) {
+                        let black = black_nv12(q_size.0, q_size.1);
+                        unsafe { queue_write(qq, &black, timestamp_100ns()) };
+                        blanked = true;
+                        info!("[VcamObs] 手机已停止推流 → 写入黑帧覆盖旧画面（应用不再显示过期照片）");
+                    }
                 }
             }
 

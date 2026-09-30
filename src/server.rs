@@ -368,6 +368,28 @@ pub async fn run_server(
             if cam_manager.cam_live.swap(now, Ordering::Relaxed) != now {
                 cam_event_tx.send(ServerEvent::CamState { active: now }).ok();
                 cam_manager.broadcast_cam_state(now).await;
+
+                // v3.4.10：应用真的打开了虚拟摄像头，但手机上还没有摄像头会话
+                // → 光推 cam_state 没人接（摄像头守护没开时 provider 不在待命态），
+                //   必须同时发 cam_request 让手机弹出"PC 请求使用摄像头"确认横幅，
+                //   用户点同意才登记会话、开始推流。这是"入口 B"的自动触发版。
+                if now && !cam_manager.cam_session.load(Ordering::Relaxed) {
+                    cam_manager
+                        .broadcast_cam_text(r#"{"type":"cam_request"}"#)
+                        .await;
+                    // 直接 info!：ServerEvent::Log 只进 GUI 事件队列，不落 audioserver.log，
+                    // 出问题时没法回溯
+                    info!(
+                        "[Cam] App opened the virtual camera but no phone session → sent cam_request"
+                    );
+                    cam_event_tx
+                        .send(ServerEvent::Log(
+                            "[Cam] App opened the virtual camera but no phone session \
+                             → sent cam_request (phone shows consent banner)"
+                                .to_string(),
+                        ))
+                        .ok();
+                }
             }
         }
     });
@@ -939,7 +961,6 @@ async fn handle_connection(
     // v3.4：摄像头会话/占用标志（跨任务共享）
     let cam_session_recv = client_manager.cam_session.clone();
     let cam_session_owner_recv = client_manager.cam_session_owner.clone();
-    let cam_live_recv = client_manager.cam_live.clone();
     let recv_task = tokio::spawn(async move {
         // Mic 会话状态（未收到 mic_start 前行为与 v2 完全相同）
         // 全双工：mic 期间下行转发照常，不摘除订阅
@@ -1053,33 +1074,42 @@ async fn handle_connection(
                             )))
                             .ok();
                     } else if compact.contains("\"type\":\"cam_start\"") {
-                        // 手机相机硬件已打开、开始推 JPEG 帧（或待命登记，语义同 mic_start）
+                        // 手机登记摄像头会话（待命，等 cam_state 唤醒）
                         cam_session_recv.store(true, Ordering::Relaxed);
                         // v3.4.5：记录本连接为会话所有者（防止重连时旧连接清理误清新连接状态）
                         *cam_session_owner_recv.lock().await = Some(key_recv.clone());
-                        // 回执附带当前占用状态：若应用已在观看，手机保持推流；
-                        // 若无人观看，手机可回到"硬件关闭"待命，等 cam_state 唤醒
-                        let live_now = cam_live_recv.load(Ordering::Relaxed);
+                        // v3.4.9：这里【不再】强制置位 cam_live。
+                        // 两路引擎现在都有真实检测（Unity=Want 事件、OBS=共享内存句柄数），
+                        // 由它们上报"有应用在观看"才唤醒手机开相机。
+                        // cam_start 只登记会话，硬件保持关闭 —— 隐私语义：待命 = 摄像头 OFF。
+                        // cam_ack 的 active 字段会被手机端当作 cam_state 直接消费
+                        // （network_service.dart 里 _camStateController.add(active)），
+                        // 所以必须上报【真实的观看状态】，不能写死 true：
+                        // 写死会让手机一登记就打开相机硬件（= 一连上就"正在使用摄像头"）。
+                        // 真实语义：登记这一刻若已有应用在看，就立刻进取景；否则保持待命。
+                        let watching_now = mgr_recv.cam_live.load(Ordering::Relaxed);
                         let mut sink = sink_recv.lock().await;
                         let _ = sink
                             .send(Message::Text(format!(
-                                r#"{{"type":"cam_ack","active":{}}}"#,
-                                live_now
+                                r#"{{"type":"cam_ack","active":{watching_now}}}"#
                             )))
                             .await;
                         drop(sink);
                         event_tx_recv
-                            .send(ServerEvent::CamSource { ip: key_recv.clone() })
-                            .ok();
-                        event_tx_recv
                             .send(ServerEvent::Log(format!(
-                                "[Cam] Session from {} (live={})",
-                                key_recv, live_now
+                                "[Cam] Session from {} → standby, waiting for an app to open the virtual camera",
+                                key_recv,
                             )))
                             .ok();
+                        info!("[Cam] Session from {key_recv} → standby (camera hardware OFF), waiting for an app to open the virtual camera");
                     } else if compact.contains("\"type\":\"cam_stop\"") {
                         // 手机端主动结束摄像头会话（或手机端确认关闭）
                         cam_session_recv.store(false, Ordering::Relaxed);
+                        // v3.4.7：重置 OBS 活跃标记（与 cam_start 时的置位对称）
+                        mgr_recv.cam_live_obs.store(false, Ordering::Relaxed);
+                        // v3.4.8：引擎不再上报活跃，cam_stop 直接关闭 cam_live 并广播
+                        mgr_recv.cam_live.store(false, Ordering::Relaxed);
+                        mgr_recv.cam_live_unity.store(false, Ordering::Relaxed);
                         // v3.4.5：清除会话所有者
                         *cam_session_owner_recv.lock().await = None;
                         if let Ok(mut mb) = mgr_recv.cam_mailbox.lock() {
@@ -1089,6 +1119,10 @@ async fn handle_connection(
                             *mb = None;
                         }
                         event_tx_recv.send(ServerEvent::CamStopped).ok();
+                        event_tx_recv
+                            .send(ServerEvent::CamState { active: false })
+                            .ok();
+                        mgr_recv.broadcast_cam_state(false).await;
                         event_tx_recv
                             .send(ServerEvent::Log(format!("[Cam] Stopped by {}", key_recv)))
                             .ok();
@@ -1210,6 +1244,10 @@ async fn handle_connection(
         };
         if is_owner && cam_session_recv.swap(false, Ordering::Relaxed) {
             *cam_session_owner_recv.lock().await = None;
+            // v3.4.8：引擎不再上报，断线时直接重置活跃状态
+            mgr_recv.cam_live.store(false, Ordering::Relaxed);
+            mgr_recv.cam_live_obs.store(false, Ordering::Relaxed);
+            mgr_recv.cam_live_unity.store(false, Ordering::Relaxed);
             if let Ok(mut mb) = mgr_recv.cam_mailbox.lock() {
                 *mb = None;
             }
@@ -1217,6 +1255,10 @@ async fn handle_connection(
                 *mb = None;
             }
             event_tx_recv.send(ServerEvent::CamStopped).ok();
+            event_tx_recv
+                .send(ServerEvent::CamState { active: false })
+                .ok();
+            mgr_recv.broadcast_cam_state(false).await;
             event_tx_recv
                 .send(ServerEvent::Log(format!("[Cam] Uplink ended: {}", key_recv)))
                 .ok();

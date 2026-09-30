@@ -206,7 +206,7 @@ mod windows_impl {
         std::ptr::write_unaligned(hdr as *mut i32, MAX_SHARED_IMAGE_SIZE as i32);
         std::ptr::write_unaligned(hdr.add(4) as *mut i32, w);
         std::ptr::write_unaligned(hdr.add(8) as *mut i32, h);
-        std::ptr::write_unaligned(hdr.add(12) as *mut i32, w); // stride = 宽（单位：像素）
+        std::ptr::write_unaligned(hdr.add(12) as *mut i32, w * 4); // stride = 每行字节数（RGBA = 宽×4）
         std::ptr::write_unaligned(hdr.add(16) as *mut i32, 0); // format = FORMAT_UINT8（RGBA8）
         std::ptr::write_unaligned(hdr.add(20) as *mut i32, 0); // resizemode
         std::ptr::write_unaligned(hdr.add(24) as *mut i32, 0); // mirrormode
@@ -255,7 +255,7 @@ mod windows_impl {
         std::ptr::write_unaligned(hdr as *mut i32, MAX_SHARED_IMAGE_SIZE as i32);
         std::ptr::write_unaligned(hdr.add(4) as *mut i32, PW);
         std::ptr::write_unaligned(hdr.add(8) as *mut i32, PH);
-        std::ptr::write_unaligned(hdr.add(12) as *mut i32, PW);
+        std::ptr::write_unaligned(hdr.add(12) as *mut i32, PW * 4); // stride = 每行字节数
         std::ptr::write_unaligned(hdr.add(16) as *mut i32, 0);
         std::ptr::write_unaligned(hdr.add(20) as *mut i32, 0);
         std::ptr::write_unaligned(hdr.add(24) as *mut i32, 0);
@@ -304,6 +304,10 @@ mod windows_impl {
     }
 
     /// 引擎主循环：打开驱动共享内存 → 循环"取帧、解码、上传、探测活跃"
+    ///
+    /// Want 事件是**真实可靠**的活跃信号：filter 由应用进程加载，应用调用
+    /// Start() 后每次取帧都会 SetEvent(h_want)；应用关闭摄像头 → filter 停止
+    /// 索要 → Want 不再触发 → 1 秒内判为释放。所以这里保留上报（v3.4.9）。
     pub fn engine(mailbox: FrameMailbox, tx: tokio::sync::mpsc::UnboundedSender<bool>) {
         info!("[Vcam] Unity Capture injection engine started");
         // 增量挂接状态：句柄跨重试累积，挂上后一直持有（与原版 C++ 行为一致）
@@ -354,7 +358,6 @@ mod windows_impl {
                 // 这里只消耗 Want 保持握手活着，filter 超时返回旧帧即可）
                 unsafe {
                     if WaitForSingleObject(s.h_want, 0) == WAIT_OBJECT_0 {
-                        last_want = Instant::now();
                         let _ = SetEvent(s.h_sent); // 告知"没有新帧"，filter 继续用旧帧
                     }
                 }

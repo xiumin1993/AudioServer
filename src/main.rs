@@ -1,9 +1,85 @@
 use eframe::egui;
+use log::{LevelFilter, Log, Metadata, Record};
+use std::cell::RefCell;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::sync::mpsc;
+use std::sync::OnceLock;
 use std::time::Instant;
 use tokio::sync::mpsc as tokio_mpsc;
 
 use audioserver::server::{run_server, ServerCommand, ServerConfig, ServerEvent, ServerStatus};
+
+// ── 双输出日志（stderr + 文件）──
+// env_logger 只能写 stderr，这里自定义 logger 同时写文件，
+// 方便排查问题时回溯完整日志。
+struct DualLogger {
+    level: LevelFilter,
+    log_file: OnceLock<std::fs::File>,
+}
+
+thread_local! {
+    static BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(512));
+}
+
+impl Log for DualLogger {
+    fn enabled(&self, meta: &Metadata) -> bool {
+        meta.level() <= self.level
+    }
+
+    fn log(&self, record: &Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        BUF.with(|buf| {
+            let mut b = buf.borrow_mut();
+            b.clear();
+            let _ = write!(
+                b,
+                "[{} {} {}] {}\n",
+                record.level(),
+                record.target(),
+                record.file().unwrap_or("?"),
+                record.args()
+            );
+            // stderr
+            let _ = std::io::stderr().write_all(&b);
+            // 文件（lazy init，只打开一次）
+            if self.log_file.get().is_none() {
+                let exe_dir = std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                    .unwrap_or_default();
+                if let Ok(f) = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(exe_dir.join("audioserver.log"))
+                {
+                    let _ = self.log_file.set(f);
+                }
+            }
+            if let Some(f) = self.log_file.get() {
+                let mut f_ref = f;
+                let _ = f_ref.write_all(&b);
+            }
+        });
+    }
+
+    fn flush(&self) {}
+}
+
+fn init_logger() {
+    let level = std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(LevelFilter::Info);
+    let logger = Box::new(DualLogger {
+        level,
+        log_file: OnceLock::new(),
+    });
+    log::set_boxed_logger(logger).ok();
+    log::set_max_level(level);
+}
 
 // ── v2 浅色主题配色 ──
 mod colors {
@@ -40,9 +116,8 @@ mod colors {
 }
 
 fn main() -> eframe::Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format_timestamp_millis()
-        .init();
+    init_logger();
+    log::info!("[Main] AudioServer starting (dual logger: stderr + audioserver.log)");
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

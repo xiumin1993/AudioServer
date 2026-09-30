@@ -30,7 +30,6 @@ use audioserver::server::{run_server, ServerCommand, ServerConfig, ServerEvent, 
 // env_logger 只能写 stderr，这里自定义 logger 同时写文件，
 // 方便排查问题时回溯完整日志。
 struct DualLogger {
-    level: LevelFilter,
     log_file: OnceLock<std::fs::File>,
 }
 
@@ -72,9 +71,37 @@ fn log_path() -> std::path::PathBuf {
     LOG_PATH.get_or_init(log_file_path).clone()
 }
 
+/// 当前日志级别，用原子量存着 —— 设置页里改完下一行日志就按新级别过滤，不用重启。
+///
+/// 为什么不用 DualLogger.level 那个字段：logger 一旦交给 `set_boxed_logger` 就再也
+/// 拿不到 `&mut`（它是全局单例、被 Arc 住），而日志宏在别的线程随时会读。
+/// 原子量是"改得动 + 不加锁"的最小组合；LevelFilter 的枚举顺序本身就是
+/// Off < Error < Warn < Info < Debug < Trace，所以直接比大小就等价于比详细程度。
+static LOG_LEVEL: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(LevelFilter::Info as usize);
+
+/// 把一个新的日志级别同时应用到两处：我们自己的过滤（LOG_LEVEL）和 log crate 的
+/// 全局 max_level（其它中间件读的是后者）。少调一处就会出现"界面显示已改成 debug，
+/// 日志却还是 info"这种最难查的假象。
+fn apply_log_level(level: LevelFilter) {
+    use std::sync::atomic::Ordering::Relaxed;
+    LOG_LEVEL.store(level as usize, Relaxed);
+    log::set_max_level(level);
+    // 这句用 info 级别写：就算刚被调成 error，改级别这个动作本身也值得留痕。
+    // （error 级别下这行会被过滤掉 —— 可接受，真要排查时先调高再调低。）
+    log::info!("[Config] log level = {}", level.as_str());
+}
+
+/// 配置文件里存的是字符串（"info"/"debug"…），解析不出来一律退回 info：
+/// 宁可少打日志，也不要因为一个拼错的单词把日志全关掉。
+fn parse_log_level(s: &str) -> LevelFilter {
+    s.parse().unwrap_or(LevelFilter::Info)
+}
+
 impl Log for DualLogger {
     fn enabled(&self, meta: &Metadata) -> bool {
-        meta.level() <= self.level
+        use std::sync::atomic::Ordering::Relaxed;
+        meta.level() as usize <= LOG_LEVEL.load(Relaxed)
     }
 
     fn log(&self, record: &Record) {
@@ -120,14 +147,15 @@ fn init_logger() {
     let level = std::env::var("RUST_LOG")
         .ok()
         .and_then(|s| s.parse().ok())
-        .or_else(|| config::get().diagnostics.log_level.parse().ok())
+        .or_else(|| Some(parse_log_level(&config::get().diagnostics.log_level)))
         .unwrap_or(LevelFilter::Info);
+    // 先装 logger 再定级别：apply_log_level 自己会打一行"级别是多少"，
+    // 顺序反了那行就被丢进空气里（还没有接收方）。
     let logger = Box::new(DualLogger {
-        level,
         log_file: OnceLock::new(),
     });
     log::set_boxed_logger(logger).ok();
-    log::set_max_level(level);
+    apply_log_level(level);
 }
 
 /// 把"配置从哪来、有没有新建、有没有被夹紧"写进日志。
@@ -255,6 +283,21 @@ fn number_options(values: &[&str], suffix: &str) -> Vec<ComboOption> {
         .iter()
         .map(|v| ComboOption { label: format!("{v}{suffix}"), value: v.to_string() })
         .collect()
+}
+
+/// 把界面上那串 "960x720" 拆成 (宽, 高)。
+/// 分隔符同时认 x / X / ×：下拉里给的是小写 x，但用户手改 config.json 时
+/// 可能照着界面上"960×720"那种排版写，别为难他。
+/// 任一维不是数字、或数字为 0 → None（调用方保留旧值不动）。
+fn parse_resolution(text: &str) -> Option<(u32, u32)> {
+    let norm = text.replace('×', "x").replace('X', "x");
+    let (w, h) = norm.split_once('x')?;
+    let w = w.trim().parse::<u32>().ok()?;
+    let h = h.trim().parse::<u32>().ok()?;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some((w, h))
 }
 
 fn main() -> eframe::Result<()> {
@@ -530,6 +573,22 @@ struct AudioServerApp {
     /// 见 persist_settings）。(字段名, 这一项是否已改完)：字段名进日志，
     /// "改完"决定落盘时机。
     settings_dirty: Vec<(&'static str, bool)>,
+    // ── v3.8.2：设置页下拉化的其余配置项（初值同样来自 config.json）──
+    /// 虚拟摄像头输出分辨率，界面上是"宽x高"一整串（落盘时拆成 camera.width/height）
+    cam_resolution: String,
+    cam_fps: String,
+    /// 两条虚拟摄像头通道各自的开关（关掉 = 不注册那个设备，见 server.rs 的 *_enabled 判断）
+    cam_unity: bool,
+    cam_obs: bool,
+    /// 日志级别（这一项是设置页里唯一改完立刻生效的，见 apply_log_level）
+    log_level: String,
+    /// 启动时是否额外开一个控制台窗口刷日志（要重启才生效：控制台必须在任何日志
+    /// 写出去之前建好，Rust 的 stdout 句柄是"第一次用到就缓存"的）
+    show_console: bool,
+    /// 上行音频落进 CABLE 时用的采样率（要和虚拟声卡的混音格式一致，不然会重采样）
+    mic_uplink_rate: String,
+    /// 上行抖动缓冲上限：网络抖动超过这个时长就丢帧保实时，不再往后堆延迟
+    mic_max_queue_ms: String,
 }
 
 impl AudioServerApp {
@@ -572,6 +631,14 @@ impl AudioServerApp {
             lang_error: None,
             config_path_text: config::config_path().map(|p| p.display().to_string()),
             settings_dirty: Vec::new(),
+            cam_resolution: format!("{}x{}", cfg.camera.width, cfg.camera.height),
+            cam_fps: cfg.camera.fps.to_string(),
+            cam_unity: cfg.camera.unity_enabled,
+            cam_obs: cfg.camera.obs_enabled,
+            log_level: cfg.diagnostics.log_level.clone(),
+            show_console: cfg.diagnostics.show_console,
+            mic_uplink_rate: cfg.mic.uplink_sample_rate.to_string(),
+            mic_max_queue_ms: cfg.mic.max_queue_ms.to_string(),
         };
         // v3.5：启动先做一次【只读】环境自检（不写注册表、不装任何东西）。
         //   · 必需驱动齐 → 和以前一样，自动开启服务端
@@ -978,6 +1045,37 @@ impl AudioServerApp {
                 "speaker.pause_while_mic_live" => {
                     cfg.speaker.pause_while_mic_live = self.pause_speaker_live
                 }
+                // ── v3.8.2：麦克风上行 / 摄像头输出 / 诊断 三组设置 ──
+                "mic.uplink_sample_rate" => {
+                    match self.mic_uplink_rate.trim().parse::<u32>() {
+                        Ok(v) => cfg.mic.uplink_sample_rate = v,
+                        Err(_) => rejected.push(key),
+                    }
+                }
+                "mic.max_queue_ms" => match self.mic_max_queue_ms.trim().parse::<u32>() {
+                    Ok(v) => cfg.mic.max_queue_ms = v,
+                    Err(_) => rejected.push(key),
+                },
+                // 分辨率在界面上是一整串 "960x720"，这里拆成两个数分别落盘。
+                // 拆不出来（用户手改过 config.json 里的宽或高，组合不在选项里）
+                // 时保留旧值，别把一半写进去。
+                "camera.resolution" => match parse_resolution(&self.cam_resolution) {
+                    Some((w, h)) => {
+                        cfg.camera.width = w;
+                        cfg.camera.height = h;
+                    }
+                    None => rejected.push(key),
+                },
+                "camera.fps" => match self.cam_fps.trim().parse::<u32>() {
+                    Ok(v) => cfg.camera.fps = v,
+                    Err(_) => rejected.push(key),
+                },
+                // 两条通道各一个开关：关掉 = 那个虚拟设备干脆不注册，
+                // 系统里的摄像头列表会少一项（有人只要 OBS，有人只要 Unity）。
+                "camera.unity_enabled" => cfg.camera.unity_enabled = self.cam_unity,
+                "camera.obs_enabled" => cfg.camera.obs_enabled = self.cam_obs,
+                "diagnostics.log_level" => cfg.diagnostics.log_level = self.log_level.clone(),
+                "diagnostics.show_console" => cfg.diagnostics.show_console = self.show_console,
                 other => log::warn!("[Config] unknown settings key {other}"),
             }
         }
@@ -993,6 +1091,20 @@ impl AudioServerApp {
                 self.channels = saved.speaker.channels.to_string();
                 self.buffer_size = saved.speaker.buffer_frames.to_string();
                 self.pause_speaker_live = saved.speaker.pause_while_mic_live;
+                self.mic_uplink_rate = saved.mic.uplink_sample_rate.to_string();
+                self.mic_max_queue_ms = saved.mic.max_queue_ms.to_string();
+                self.cam_resolution =
+                    format!("{}x{}", saved.camera.width, saved.camera.height);
+                self.cam_fps = saved.camera.fps.to_string();
+                self.cam_unity = saved.camera.unity_enabled;
+                self.cam_obs = saved.camera.obs_enabled;
+                self.log_level = saved.diagnostics.log_level.clone();
+                self.show_console = saved.diagnostics.show_console;
+                // 日志级别是这一堆里唯一【不用重启】就生效的：当场换掉过滤器，
+                // 下一行日志就按新级别走。其余（端口/采样率/设备/控制台）都要重启。
+                if keys.contains(&"diagnostics.log_level") {
+                    apply_log_level(parse_log_level(&saved.diagnostics.log_level));
+                }
                 if !rejected.is_empty() {
                     self.add_log(format!(
                         "[Config] kept previous value for {} (not a number yet)",
@@ -2115,7 +2227,108 @@ impl AudioServerApp {
     }
 
     /// v3.4：Camera 模式 Settings Tab（无参数可调，放使用说明与设备名）
-    fn show_camera_settings_tab(&self, ui: &mut egui::Ui) {
+    fn show_camera_settings_tab(&mut self, ui: &mut egui::Ui, is_running: bool) {
+        // ── 虚拟摄像头输出卡片（v3.8.2）──
+        // 分辨率 / 帧率 / 两条通道开关原来只能手改 config.json，现在挪到界面上。
+        // 为什么做成下拉而不是输入框：宽和高必须成对且都是偶数（NV12 的色度是 2x2
+        // 子采样，奇数尺寸会被 config.rs 的 sanitize 改掉），手打很容易填出一个
+        // "看着填对了、其实被系统改过"的值。这里直接给一组现成档位。
+        let resolution_options = vec![
+            ComboOption { label: "640x480".into(), value: "640x480".into() },
+            ComboOption { label: "854x480".into(), value: "854x480".into() },
+            ComboOption { label: "960x540".into(), value: "960x540".into() },
+            ComboOption { label: "960x720".into(), value: "960x720".into() },
+            ComboOption { label: "1280x720".into(), value: "1280x720".into() },
+            ComboOption { label: "1920x1080".into(), value: "1920x1080".into() },
+        ];
+        let fps_options = number_options(&["15", "24", "30", "60"], " fps");
+
+        let out_frame = egui::Frame::none()
+            .fill(colors::BG_WHITE)
+            .stroke(egui::Stroke::new(1.0_f32, colors::BORDER))
+            .rounding(8.0)
+            .inner_margin(egui::Margin::same(14.0));
+        out_frame.show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(lang::t("cam.output"))
+                    .size(11.0)
+                    .color(colors::TEXT_MUTED),
+            );
+            ui.add_space(8.0);
+            // 服务在跑 = 两个共享内存通道已经按当前尺寸建好了，中途改尺寸会让
+            // 已经打开摄像头的软件拿到错乱的帧 —— 和音频参数一样锁起来。
+            ui.add_enabled_ui(!is_running, |ui| {
+                egui::Grid::new("camera_output_settings")
+                    .num_columns(2)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(lang::t("cam.resolution"))
+                                .size(13.0)
+                                .color(colors::TEXT_SECONDARY),
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                Self::config_dropdown(
+                                    ui,
+                                    &mut self.cam_resolution,
+                                    "camera.resolution",
+                                    &resolution_options,
+                                    &mut self.settings_dirty,
+                                );
+                            },
+                        );
+                        ui.end_row();
+
+                        ui.label(
+                            egui::RichText::new(lang::t("cam.fps"))
+                                .size(13.0)
+                                .color(colors::TEXT_SECONDARY),
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                Self::config_dropdown(
+                                    ui,
+                                    &mut self.cam_fps,
+                                    "camera.fps",
+                                    &fps_options,
+                                    &mut self.settings_dirty,
+                                );
+                            },
+                        );
+                        ui.end_row();
+                    });
+                ui.add_space(6.0);
+                // 开关不放进 Grid：中文标签长短不一，跟右边的下拉框对不齐，
+                // 而且勾选框自己就有"方块 + 文字"的形状，一眼看得懂。
+                let old_unity = self.cam_unity;
+                ui.checkbox(&mut self.cam_unity, lang::t("cam.unity"));
+                if self.cam_unity != old_unity {
+                    // 和"麦忙时暂停外放"同一套：开关没有中间态，点一下当场落盘；
+                    // persist_settings 写完会以文件为准刷新界面（sanitize 过的那份）
+                    self.persist_settings(&["camera.unity_enabled"]);
+                }
+                ui.label(
+                    egui::RichText::new(lang::t("cam.unity_hint"))
+                        .size(11.0)
+                        .color(colors::TEXT_MUTED),
+                );
+                ui.add_space(4.0);
+                if ui.checkbox(&mut self.cam_obs, lang::t("cam.obs")).changed() {
+                    self.persist_settings(&["camera.obs_enabled"]);
+                }
+                ui.label(
+                    egui::RichText::new(lang::t("cam.obs_hint"))
+                        .size(11.0)
+                        .color(colors::TEXT_MUTED),
+                );
+            });
+        });
+
+        ui.add_space(8.0);
+
         let card = egui::Frame::none()
             .fill(colors::BG_WHITE)
             .stroke(egui::Stroke::new(1.0_f32, colors::BORDER))
@@ -2262,13 +2475,91 @@ impl AudioServerApp {
         });
     }
 
+    /// v3.8.2：诊断卡片 —— 三种模式的【设置】页底部都有。
+    /// ----------------------------------------------------------------------------
+    /// 日志级别：这一项是整页唯一【改完立刻生效】的（见 apply_log_level）。
+    ///          故意不在服务运行时锁掉它 —— 排障时最有用的动作恰恰是"正跑着的时候
+    ///          点开 debug 看细节"，锁住就等于把这个场景删了。
+    /// 控制台窗口：必须重启才生效，而且原因没法绕过：Rust 的 stdout/stderr 句柄是
+    ///          "第一次用到时才缓存"，程序一开头就把输出写进了空句柄，中途再
+    ///          AllocConsole 也接不回已经丢掉的输出（详见文件头 windows_subsystem 那段）。
+    ///          所以这里勾完要在界面上说清楚"重启后才有窗口"，别让人以为没生效。
+    fn show_diagnostics_card(&mut self, ui: &mut egui::Ui, _is_running: bool) {
+        let level_options = vec![
+            ComboOption { label: "error".into(), value: "error".into() },
+            ComboOption { label: "warn".into(), value: "warn".into() },
+            ComboOption { label: "info".into(), value: "info".into() },
+            ComboOption { label: "debug".into(), value: "debug".into() },
+            ComboOption { label: "trace".into(), value: "trace".into() },
+        ];
+
+        let card = egui::Frame::none()
+            .fill(colors::BG_WHITE)
+            .stroke(egui::Stroke::new(1.0_f32, colors::BORDER))
+            .rounding(8.0)
+            .inner_margin(egui::Margin::same(14.0));
+        card.show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(lang::t("settings.diagnostics"))
+                    .size(11.0)
+                    .color(colors::TEXT_MUTED),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(lang::t("settings.log_level"))
+                        .size(13.0)
+                        .color(colors::TEXT_SECONDARY),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    Self::config_dropdown(
+                        ui,
+                        &mut self.log_level,
+                        "diagnostics.log_level",
+                        &level_options,
+                        &mut self.settings_dirty,
+                    );
+                });
+            });
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(lang::t("settings.log_level_hint"))
+                    .size(11.0)
+                    .color(colors::TEXT_MUTED),
+            );
+            ui.add_space(8.0);
+            let old_console = self.show_console;
+            ui.checkbox(&mut self.show_console, lang::t("settings.show_console"));
+            if self.show_console != old_console {
+                self.persist_settings(&["diagnostics.show_console"]);
+            }
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(lang::t("settings.show_console_hint"))
+                    .size(11.0)
+                    .color(colors::TEXT_MUTED),
+            );
+            ui.add_space(6.0);
+            // 日志写在哪：这一行原来只在【日志】页脚出现，设置页里看不到。
+            // 收反馈时第一句问的就是路径，所以直接印在设置页上。
+            ui.label(
+                egui::RichText::new(lang::tf("settings.log_path", &[("path", &log_path().display().to_string())]))
+                    .size(11.0)
+                    .monospace()
+                    .color(colors::TEXT_MUTED),
+            );
+        });
+    }
+
     // ── Settings Tab ──
     fn show_settings_tab(&mut self, ui: &mut egui::Ui, is_running: bool) {
         // v3：Mic 模式呈现麦克风设置
         if self.mode == AppMode::Mic {
-            self.show_mic_settings_tab(ui);
+            self.show_mic_settings_tab(ui, is_running);
             ui.add_space(8.0);
             self.show_language_card(ui);
+            ui.add_space(8.0);
+            self.show_diagnostics_card(ui, is_running);
             ui.add_space(8.0);
             self.show_config_card(ui);
             self.flush_settings_if_ready();
@@ -2276,9 +2567,11 @@ impl AudioServerApp {
         }
         // v3.4：Camera 模式呈现摄像头设置（设备名提示 + 待命说明）
         if self.mode == AppMode::Camera {
-            self.show_camera_settings_tab(ui);
+            self.show_camera_settings_tab(ui, is_running);
             ui.add_space(8.0);
             self.show_language_card(ui);
+            ui.add_space(8.0);
+            self.show_diagnostics_card(ui, is_running);
             ui.add_space(8.0);
             self.show_config_card(ui);
             self.flush_settings_if_ready();
@@ -2456,6 +2749,8 @@ impl AudioServerApp {
         ui.add_space(8.0);
         self.show_language_card(ui);
         ui.add_space(8.0);
+        self.show_diagnostics_card(ui, is_running);
+        ui.add_space(8.0);
         self.show_config_card(ui);
 
         // 本帧结束前统一判断：有输入框"改完了"就写一次 config.json。
@@ -2506,7 +2801,7 @@ impl AudioServerApp {
     }
 
     // ── v3：Mic 模式 Settings Tab ──
-    fn show_mic_settings_tab(&mut self, ui: &mut egui::Ui) {
+    fn show_mic_settings_tab(&mut self, ui: &mut egui::Ui, is_running: bool) {
         let card = egui::Frame::none()
             .fill(colors::BG_WHITE)
             .stroke(egui::Stroke::new(1.0_f32, colors::BORDER))
@@ -2591,6 +2886,79 @@ impl AudioServerApp {
             ui.add_space(6.0);
             ui.label(
                 egui::RichText::new(lang::t("settings.uplink_hint"))
+                    .size(11.0)
+                    .color(colors::TEXT_MUTED),
+            );
+        });
+
+        ui.add_space(8.0);
+
+        // ── 上行注入参数（v3.8.2 从"只能手改 config.json"挪到界面上）──
+        // 上面那张卡片显示的是【手机实际推上来】的格式（只读），
+        // 这一张是【电脑往虚拟声卡里灌】时用的是什么格式 —— 两者可以不一样：
+        // 手机推 48k 单声道，电脑按 CABLE 的混音格式（一般 48k 立体声）灌进去。
+        let rate_options = number_options(&["44100", "48000", "96000", "192000"], " Hz");
+        let queue_options = number_options(&["100", "150", "250", "400", "600"], " ms");
+        let card3 = egui::Frame::none()
+            .fill(colors::BG_WHITE)
+            .stroke(egui::Stroke::new(1.0_f32, colors::BORDER))
+            .rounding(8.0)
+            .inner_margin(egui::Margin::same(14.0));
+        card3.show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(lang::t("settings.inject"))
+                    .size(11.0)
+                    .color(colors::TEXT_MUTED),
+            );
+            ui.add_space(8.0);
+            // 注入流已经按当前格式开着了，中途换采样率/缓冲等于抽掉地基 —— 锁
+            ui.add_enabled_ui(!is_running, |ui| {
+                egui::Grid::new("mic_inject_settings")
+                    .num_columns(2)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(lang::t("settings.uplink_rate"))
+                                .size(13.0)
+                                .color(colors::TEXT_SECONDARY),
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                Self::config_dropdown(
+                                    ui,
+                                    &mut self.mic_uplink_rate,
+                                    "mic.uplink_sample_rate",
+                                    &rate_options,
+                                    &mut self.settings_dirty,
+                                );
+                            },
+                        );
+                        ui.end_row();
+
+                        ui.label(
+                            egui::RichText::new(lang::t("settings.max_queue"))
+                                .size(13.0)
+                                .color(colors::TEXT_SECONDARY),
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                Self::config_dropdown(
+                                    ui,
+                                    &mut self.mic_max_queue_ms,
+                                    "mic.max_queue_ms",
+                                    &queue_options,
+                                    &mut self.settings_dirty,
+                                );
+                            },
+                        );
+                        ui.end_row();
+                    });
+            });
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(lang::t("settings.inject_hint"))
                     .size(11.0)
                     .color(colors::TEXT_MUTED),
             );

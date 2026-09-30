@@ -19,6 +19,7 @@
 // ============================================================================
 
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 /// 取一条文案。key 可以是运行时变量，所以这里包一层，
 /// 让 main.rs / env_check.rs 不必自己写 `t!` 宏（宏还必须在调用它的 crate 里初始化）。
@@ -175,6 +176,10 @@ fn read_setting(path: &Path, key: &str) -> Option<String> {
 }
 
 /// 读用户选过的语言；没选过 / 文件不存在 = 跟随系统
+///
+/// 注意：这个函数【每次调用都会真去读一次文件】，所以只允许在启动时调一次。
+/// 界面里想知道当前选的是哪一档，请用 [`current_choice`]（内存缓存）。
+/// 历史事故：设置页每帧都调它，audioserver.log 里同一行刷了三万多次。
 pub fn saved_choice(path: &Path) -> LanguageChoice {
     match read_setting(path, "language") {
         Some(v) => {
@@ -184,6 +189,28 @@ pub fn saved_choice(path: &Path) -> LanguageChoice {
         }
         None => LanguageChoice::Auto,
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// 当前选择档位的内存缓存（给界面用，避免每帧读文件）
+// ──────────────────────────────────────────────────────────────────────────
+
+// std::sync::Mutex 而不是 OnceLock：用户在界面里点按钮会改变档位，需要能写。
+// 用 Mutex 包一层，读的时候 lock().clone()，几纳秒的事，绝不影响帧率。
+static CURRENT_CHOICE: OnceLock<Mutex<LanguageChoice>> = OnceLock::new();
+
+fn choice_cell() -> &'static Mutex<LanguageChoice> {
+    CURRENT_CHOICE.get_or_init(|| Mutex::new(LanguageChoice::Auto))
+}
+
+/// 界面上的三个按钮该高亮哪个 —— 来自内存，不做任何 I/O
+pub fn current_choice() -> LanguageChoice {
+    *choice_cell().lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 把档位记进内存（启动时和界面切换时各调一次）
+fn remember_choice(choice: LanguageChoice) {
+    *choice_cell().lock().unwrap_or_else(|e| e.into_inner()) = choice;
 }
 
 /// 整份重写 settings.txt（只有一行有用，重写比增量合并简单可靠）
@@ -217,9 +244,12 @@ language={}\n",
 pub fn apply_startup_locale() -> (&'static str, &'static str) {
     let path = settings_path();
     let (code, source) = if let Ok(env_v) = std::env::var("PCSPEAKER_LANG") {
-        (LanguageChoice::parse(&env_v).resolve(), "env PCSPEAKER_LANG")
+        let c = LanguageChoice::parse(&env_v);
+        remember_choice(c);
+        (c.resolve(), "env PCSPEAKER_LANG")
     } else {
         let saved = saved_choice(&path);
+        remember_choice(saved);
         let source = if saved == LanguageChoice::Auto {
             "system language"
         } else {
@@ -235,6 +265,7 @@ pub fn apply_startup_locale() -> (&'static str, &'static str) {
 /// 在设置页里切换语言：立刻生效 + 落盘。返回落盘错误（界面会显示出来）
 pub fn switch_to(choice: LanguageChoice) -> std::io::Result<()> {
     set_locale(choice.resolve());
+    remember_choice(choice);
     save_choice(&settings_path(), choice)
 }
 

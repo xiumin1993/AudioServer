@@ -432,7 +432,12 @@ impl AudioServerApp {
         app
     }
 
-    fn poll_server_events(&mut self, ctx: &egui::Context) {
+    /// 取走服务端事件并落到界面状态上。
+    ///
+    /// 返回值 = "这一帧确实取到了东西"。v3.7 CPU 优化专用：
+    /// 调用方据此决定要不要立刻再重绘一次（数据驱动重绘），
+    /// 而不是像以前那样无条件满帧重绘。
+    fn poll_server_events(&mut self, ctx: &egui::Context) -> bool {
         let mut events = Vec::new();
         if let Some(rx) = &self.event_rx {
             for _ in 0..50 {
@@ -445,14 +450,17 @@ impl AudioServerApp {
                         self.event_rx = None;
                         self.start_time = None;
                         self.add_log("Server process ended".to_string());
-                        return;
+                        // 状态变了 → 界面必须重画，返回 true
+                        return true;
                     }
                 }
             }
         }
+        let got_any = !events.is_empty();
         for event in events {
             self.handle_event(event, ctx);
         }
+        got_any
     }
 
     fn handle_event(&mut self, event: ServerEvent, ctx: &egui::Context) {
@@ -1728,9 +1736,11 @@ impl AudioServerApp {
             .rounding(8.0)
             .inner_margin(egui::Margin::same(14.0));
 
-        // 当前生效的语言 + 用户在 settings.txt 里存过的选择（用来决定哪个按钮高亮）
+        // 当前生效的语言 + 用户在 settings.txt 里存过的选择（用来决定哪个按钮高亮）。
+        // current_choice() 读的是内存缓存：这里每帧都会执行，早先用 saved_choice()
+        // 等于每帧读一次文件 + 打一行日志，audioserver.log 被同一行灌了三万多次。
         let current = lang::locale();
-        let saved = lang::saved_choice(&lang::settings_path());
+        let saved = lang::current_choice();
 
         card.show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -2174,7 +2184,7 @@ impl eframe::App for AudioServerApp {
             return;
         }
 
-        self.poll_server_events(ctx);
+        let had_events = self.poll_server_events(ctx);
         let is_running = self.server_status == ServerStatus::Running;
 
         // 顶部面板：Header
@@ -2237,7 +2247,28 @@ impl eframe::App for AudioServerApp {
                 }
             });
 
-        ctx.request_repaint();
+        // ── v3.7 CPU 优化：按需重绘（这里原来是满帧空转）──────────────────
+        // 原来这一句是【无条件】ctx.request_repaint()，等于告诉 eframe
+        // "画完这张马上画下一张" —— 窗口就以能跑到的最高帧率永久重绘。
+        // 实测：什么都没干的情况下烧掉 1.15 个 CPU 核心（任务管理器 14~16%，
+        // 电源计划直接判定"非常高"），而音频/视频链路本身几乎不占 CPU。
+        // 现在分三条：
+        //   1) 这一帧确实取到了事件（电平 ≈20Hz、链路统计 1Hz、日志、预览帧）
+        //      → 立刻再画一帧，数据一到就上屏，不用等心跳，波形不会变卡；
+        //   2) 没取到事件 → 只挂一个定时心跳兜底，让顶栏运行时长照常走秒；
+        //   3) 心跳看"屏幕上有活的东西"：录音/推流中 250ms（红点呼吸 +
+        //      万一事件稀疏也不僵），完全空闲 1000ms。
+        // 不用操心"空闲不重绘会不会点不动"：鼠标移动、点击、下拉框开合
+        // 这些交互由 winit 输入事件和 egui 自己的动画机制触发重绘，
+        // 与本条心跳无关。门禁页早就是这套写法（见上面 env_gate 分支），
+        // 主界面是漏改的那一处。
+        if had_events {
+            ctx.request_repaint();
+        } else {
+            let busy = self.mic_live || self.cam_live;
+            let every_ms = if busy { 250 } else { 1000 };
+            ctx.request_repaint_after(std::time::Duration::from_millis(every_ms));
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

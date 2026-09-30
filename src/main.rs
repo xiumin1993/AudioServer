@@ -9,6 +9,7 @@ use std::time::Instant;
 use tokio::sync::mpsc as tokio_mpsc;
 
 use audioserver::env_check::{self, EnvGuide, GuideAction};
+use audioserver::lang;
 use audioserver::server::{run_server, ServerCommand, ServerConfig, ServerEvent, ServerStatus};
 
 // ── 双输出日志（stderr + 文件）──
@@ -120,6 +121,12 @@ fn main() -> eframe::Result<()> {
     init_logger();
     log::info!("[Main] AudioServer starting (dual logger: stderr + audioserver.log)");
 
+    // i18n：先决定界面语言，再画任何一帧。
+    // 优先级 = PCSPEAKER_LANG 环境变量 > exe 同目录 settings.txt > 系统显示语言。
+    // 放在这里（而不是 App::new 里）是因为窗口标题在 run_native 就要用到文案。
+    let (locale, locale_from) = lang::apply_startup_locale();
+    log::info!("[Main] UI language = {locale} (from {locale_from})");
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([420.0, 540.0])
@@ -127,8 +134,11 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
+    // 英文 420px 宽够用，但中文标题更短、按钮更长，宽度先不随语言变（下一版再看）
+    let window_title = lang::t("app.title");
+
     eframe::run_native(
-        "Audio Server",
+        &window_title,
         options,
         Box::new(|cc| {
             // 中文字体兜底（必须在设 visuals / 建界面之前）
@@ -162,9 +172,7 @@ fn main() -> eframe::Result<()> {
             // 门禁生效时标题栏也换成"需要准备驱动"，任务栏上一眼可辨
             if let Some(g) = app.env_gate.as_ref() {
                 cc.egui_ctx
-                    .send_viewport_cmd(egui::ViewportCommand::Title(
-                        g.viewport_title().to_string(),
-                    ));
+                    .send_viewport_cmd(egui::ViewportCommand::Title(g.viewport_title()));
             }
             Ok(Box::new(app))
         }),
@@ -215,7 +223,7 @@ fn install_cjk_fonts(ctx: &egui::Context) {
             Err(_) => continue,
         };
         if !looks_like_font(&bytes) {
-            log::warn!("[Main] {path} 不像字体文件，跳过");
+            log::warn!("[Main] {path} does not look like a font file, skipping");
             continue;
         }
         let mut fonts = egui::FontDefinitions::default();
@@ -236,7 +244,7 @@ fn install_cjk_fonts(ctx: &egui::Context) {
         log::info!("[Main] CJK font installed: {path}");
         return;
     }
-    log::warn!("[Main] 系统里没找到可用的中文字体，界面中文会显示成方框");
+    log::warn!("[Main] no usable CJK font found in the system, Chinese UI text will render as boxes");
 }
 
 // ── Tab 枚举 ──
@@ -333,6 +341,9 @@ struct AudioServerApp {
     // ── v3.5 启动环境门禁 ──
     /// Some = 必需驱动缺失，主窗口整页只显示向导，服务端线程不起
     env_gate: Option<EnvGuide>,
+    // ── v3.6 国际化 ──
+    /// 上一次切换语言时 settings.txt 写入失败的原文（界面显示，成功则清空）
+    lang_error: Option<String>,
 }
 
 impl AudioServerApp {
@@ -368,6 +379,7 @@ impl AudioServerApp {
             cam_caps: None,
             cam_texture: None,
             env_gate: None,
+            lang_error: None,
         };
         // v3.5：启动先做一次【只读】环境自检（不写注册表、不装任何东西）。
         //   · 必需驱动齐 → 和以前一样，自动开启服务端
@@ -395,6 +407,27 @@ impl AudioServerApp {
         } else {
             log::info!("[Main] 环境门禁生效：服务端未启动，等待用户安装驱动");
             app.env_gate = Some(EnvGuide::new(report));
+        }
+        // ── 开发/验收用的界面定位（普通用户不会设置这两个变量，行为完全不变）──
+        // 为什么要有：国际化验收要拍"每种语言 × 每个模式 × 每个页签"的截图，
+        // 而脚本模拟鼠标点击太脆弱。用环境变量直接指定首屏落在哪，拍出来就是哪。
+        //   PCSPEAKER_DEMO_MODE = speaker | mic | camera
+        //   PCSPEAKER_DEMO_TAB  = connection | settings | log
+        if let Ok(m) = std::env::var("PCSPEAKER_DEMO_MODE") {
+            app.mode = match m.to_lowercase().as_str() {
+                "mic" => AppMode::Mic,
+                "camera" => AppMode::Camera,
+                _ => AppMode::Speaker,
+            };
+            log::info!("[Main] demo override: mode = {m}");
+        }
+        if let Ok(t) = std::env::var("PCSPEAKER_DEMO_TAB") {
+            app.active_tab = match t.to_lowercase().as_str() {
+                "settings" => AppTab::Settings,
+                "log" => AppTab::Log,
+                _ => AppTab::Connection,
+            };
+            log::info!("[Main] demo override: tab = {t}");
         }
         app
     }
@@ -607,7 +640,10 @@ impl AudioServerApp {
     }
 
     fn audio_summary(&self) -> String {
-        format!("{}Hz · {}ch · PCM", self.sample_rate, self.channels)
+        lang::tf(
+            "footer.audio_summary",
+            &[("rate", &self.sample_rate), ("ch", &self.channels)],
+        )
     }
 
     // ── Header：状态 + 开关 ──
@@ -631,31 +667,31 @@ impl AudioServerApp {
 
             ui.add_space(10.0);
 
-            // 状态文字（v3：随模式变化）
+            // 状态文字（v3：随模式变化；v3.6：全部走 i18n）
             ui.vertical(|ui| {
                 let title = if !is_running {
-                    "Server Stopped"
+                    lang::t("header.stopped")
                 } else if self.mode == AppMode::Mic {
                     if self.mic_live && self.mic_muted {
-                        "Mic Muted"
+                        lang::t("header.mic_muted")
                     } else if self.mic_live {
-                        "Mic Live"
+                        lang::t("header.mic_live")
                     } else if self.mic_session {
-                        "Mic Standby"
+                        lang::t("header.mic_standby")
                     } else {
-                        "Mic Idle"
+                        lang::t("header.mic_idle")
                     }
                 } else if self.mode == AppMode::Camera {
                     // v3.4：摄像头模式标题（LIVE = 有应用真的在看，手机相机已开）
                     if self.cam_live {
-                        "Cam Live"
+                        lang::t("header.cam_live")
                     } else if self.cam_session {
-                        "Cam Standby"
+                        lang::t("header.cam_standby")
                     } else {
-                        "Cam Idle"
+                        lang::t("header.cam_idle")
                     }
                 } else {
-                    "Server Running"
+                    lang::t("header.running")
                 };
                 ui.label(
                     egui::RichText::new(title)
@@ -663,26 +699,27 @@ impl AudioServerApp {
                         .strong()
                         .color(colors::TEXT_PRIMARY),
                 );
+                let uptime = self.uptime_str();
                 let subtitle = if !is_running {
-                    "Toggle to start".to_string()
+                    lang::t("header.toggle_to_start")
                 } else if self.mode == AppMode::Mic {
                     if self.mic_live {
-                        format!("Phone → CABLE · Uptime {}", self.uptime_str())
+                        lang::tf("header.mic_sub_live", &[("uptime", &uptime)])
                     } else if self.mic_session {
-                        "Phone on standby · speaks when any app opens the mic".to_string()
+                        lang::t("header.mic_sub_standby")
                     } else {
-                        "Waiting for phone connection".to_string()
+                        lang::t("header.mic_sub_idle")
                     }
                 } else if self.mode == AppMode::Camera {
                     if self.cam_live {
-                        format!("Phone → Unity Video Capture · Uptime {}", self.uptime_str())
+                        lang::tf("header.cam_sub_live", &[("uptime", &uptime)])
                     } else if self.cam_session {
-                        "Phone on standby · opens camera when any app watches it".to_string()
+                        lang::t("header.cam_sub_standby")
                     } else {
-                        "Waiting for phone camera session".to_string()
+                        lang::t("header.cam_sub_idle")
                     }
                 } else {
-                    format!("Uptime {}", self.uptime_str())
+                    lang::tf("header.uptime", &[("uptime", &uptime)])
                 };
                 ui.label(
                     egui::RichText::new(subtitle)
@@ -751,9 +788,9 @@ impl AudioServerApp {
         ui.horizontal(|ui| {
             ui.set_height(34.0);
             let modes = [
-                (AppMode::Speaker, "Speaker Mode"),
-                (AppMode::Mic, "Microphone Mode"),
-                (AppMode::Camera, "Camera Mode"),
+                (AppMode::Speaker, lang::t("mode.speaker")),
+                (AppMode::Mic, lang::t("mode.microphone")),
+                (AppMode::Camera, lang::t("mode.camera")),
             ];
             let gap = 4.0_f32;
             let btn_w = (ui.available_width() - gap * (modes.len() as f32 - 1.0))
@@ -856,9 +893,9 @@ impl AudioServerApp {
         ui.horizontal(|ui| {
             ui.set_height(38.0);
             let tabs = [
-                (AppTab::Connection, "Connection"),
-                (AppTab::Settings, "Settings"),
-                (AppTab::Log, "Log"),
+                (AppTab::Connection, lang::t("tabs.connection")),
+                (AppTab::Settings, lang::t("tabs.settings")),
+                (AppTab::Log, lang::t("tabs.log")),
             ];
             let total_width = ui.available_width();
             let tab_width = total_width / tabs.len() as f32;
@@ -919,19 +956,27 @@ impl AudioServerApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // v3：摘要随模式变化
                 let summary = if !is_running {
-                    "Idle".to_string()
+                    lang::t("footer.idle")
                 } else if self.mode == AppMode::Mic {
                     match &self.mic_source {
-                        Some((_, sr, ch)) => format!("{}Hz · {}ch · MIC", sr, ch),
-                        None => "48kHz · 1ch · MIC (idle)".to_string(),
+                        Some((_, sr, ch)) => lang::tf(
+                            "footer.mic_summary",
+                            &[("rate", &sr.to_string()), ("ch", &ch.to_string())],
+                        ),
+                        None => lang::t("footer.mic_summary_idle"),
                     }
                 } else if self.mode == AppMode::Camera {
                     // v3.4：底部摘要显示当前上行画质（有统计时）
                     match &self.cam_stats {
-                        Some(s) if s.width > 0 => {
-                            format!("{}×{} · {}fps · CAM", s.width, s.height, s.fps)
-                        }
-                        _ => "CAM (idle)".to_string(),
+                        Some(s) if s.width > 0 => lang::tf(
+                            "footer.cam_summary",
+                            &[
+                                ("w", &s.width.to_string()),
+                                ("h", &s.height.to_string()),
+                                ("fps", &s.fps.to_string()),
+                            ],
+                        ),
+                        _ => lang::t("footer.cam_summary_idle"),
                     }
                 } else {
                     self.audio_summary()
@@ -978,9 +1023,13 @@ impl AudioServerApp {
         ui.horizontal(|ui| {
             ui.set_height(56.0);
             let conns = [
-                (ConnectionType::Wifi, "WiFi LAN", true),
-                (ConnectionType::Usb, "USB", false),
-                (ConnectionType::Bluetooth, "Bluetooth", false),
+                (ConnectionType::Wifi, lang::t("conn.wifi"), true),
+                (ConnectionType::Usb, lang::t("conn.usb"), false),
+                (
+                    ConnectionType::Bluetooth,
+                    lang::t("conn.bluetooth"),
+                    false,
+                ),
             ];
             let gap = 8.0_f32;
             let btn_w = (ui.available_width() - gap * 2.0) / 3.0;
@@ -1043,7 +1092,7 @@ impl AudioServerApp {
 
         card_frame.show(ui, |ui| {
             ui.label(
-                egui::RichText::new("CONNECTION INFO")
+                egui::RichText::new(lang::t("conn.info"))
                     .size(11.0)
                     .color(colors::TEXT_MUTED),
             );
@@ -1052,7 +1101,7 @@ impl AudioServerApp {
             // IP 行
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("Local IP")
+                    egui::RichText::new(lang::t("conn.local_ip"))
                         .size(13.0)
                         .color(colors::TEXT_SECONDARY),
                 );
@@ -1060,7 +1109,9 @@ impl AudioServerApp {
                     if ui
                         .add(
                             egui::Button::new(
-                                egui::RichText::new("Copy").size(10.0).color(colors::ACCENT),
+                                egui::RichText::new(lang::t("conn.copy"))
+                                    .size(10.0)
+                                    .color(colors::ACCENT),
                             )
                             .fill(colors::ACCENT_BG)
                             .stroke(egui::Stroke::new(1.0_f32, colors::ACCENT_BORDER))
@@ -1088,7 +1139,9 @@ impl AudioServerApp {
             let ws_addr = format!("ws://{}:{}/ws/audio", local_ip, self.port);
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("WebSocket")
+                    // WebSocket 是全球通用词，两种语言同字，但仍然走文案表（保持"界面
+                    // 上没有一处硬编码文案"这条纪律，将来加语言只改 toml）
+                    egui::RichText::new(lang::t("conn.websocket"))
                         .size(13.0)
                         .color(colors::TEXT_SECONDARY),
                 );
@@ -1096,7 +1149,9 @@ impl AudioServerApp {
                     if ui
                         .add(
                             egui::Button::new(
-                                egui::RichText::new("Copy").size(10.0).color(colors::ACCENT),
+                                egui::RichText::new(lang::t("conn.copy"))
+                                    .size(10.0)
+                                    .color(colors::ACCENT),
                             )
                             .fill(colors::ACCENT_BG)
                             .stroke(egui::Stroke::new(1.0_f32, colors::ACCENT_BORDER))
@@ -1142,13 +1197,13 @@ impl AudioServerApp {
                 ui.add_space(8.0);
                 ui.vertical(|ui| {
                     ui.label(
-                        egui::RichText::new("Connected Clients")
+                        egui::RichText::new(lang::t("conn.clients"))
                             .size(12.0)
                             .color(colors::TEXT_MUTED),
                     );
                     if self.client_count == 0 {
                         ui.label(
-                            egui::RichText::new("Waiting...")
+                            egui::RichText::new(lang::t("conn.waiting"))
                                 .size(11.0)
                                 .color(colors::TEXT_DISABLED),
                         );
@@ -1169,14 +1224,14 @@ impl AudioServerApp {
         // 卡片 1：虚拟麦克风状态 + 实时电平
         card.show(ui, |ui| {
             ui.label(
-                egui::RichText::new("VIRTUAL MICROPHONE")
+                egui::RichText::new(lang::t("mic.virtual_card"))
                     .size(11.0)
                     .color(colors::TEXT_MUTED),
             );
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("Phone Mic (VB-CABLE)")
+                    egui::RichText::new(lang::t("mic.phone_mic"))
                         .size(14.0)
                         .strong()
                         .color(colors::TEXT_PRIMARY),
@@ -1185,14 +1240,14 @@ impl AudioServerApp {
                 if self.mic_engine_device.is_some() {
                     Self::show_chip(
                         ui,
-                        "READY",
+                        &lang::t("mic.chip_ready"),
                         egui::Color32::from_rgb(4, 120, 87),
                         egui::Color32::from_rgb(236, 253, 245),
                     );
                 } else {
                     Self::show_chip(
                         ui,
-                        "DRIVER NEEDED",
+                        &lang::t("mic.chip_driver_needed"),
                         colors::WARN_TEXT,
                         colors::WARN_BG,
                     );
@@ -1201,21 +1256,21 @@ impl AudioServerApp {
                 if self.mic_live && self.mic_muted {
                     Self::show_chip(
                         ui,
-                        "MUTED",
+                        &lang::t("mic.chip_muted"),
                         egui::Color32::from_rgb(120, 113, 108),
                         egui::Color32::from_rgb(245, 245, 244),
                     );
                 } else if self.mic_live {
                     Self::show_chip(
                         ui,
-                        "LIVE",
+                        &lang::t("mic.chip_live"),
                         egui::Color32::from_rgb(190, 18, 60),
                         egui::Color32::from_rgb(255, 228, 230),
                     );
                 } else if self.mic_session {
                     Self::show_chip(
                         ui,
-                        "STANDBY",
+                        &lang::t("mic.chip_standby"),
                         egui::Color32::from_rgb(4, 120, 87),
                         egui::Color32::from_rgb(236, 253, 245),
                     );
@@ -1225,9 +1280,9 @@ impl AudioServerApp {
             self.show_level_bars(ui);
             ui.add_space(4.0);
             let hint = if self.mic_engine_device.is_some() {
-                "PC apps: select \"CABLE Output\" as input device — phone mic is live automatically."
+                lang::t("mic.hint_ready")
             } else {
-                "VB-CABLE playback device not found. Install VB-Audio Virtual Cable, then restart."
+                lang::t("mic.hint_missing")
             };
             ui.label(
                 egui::RichText::new(hint)
@@ -1237,9 +1292,9 @@ impl AudioServerApp {
             ui.add_space(6.0);
             // 下行暂停开关按钮（默认全双工同时进行）
             let btn_label = if self.pause_speaker_live {
-                "Speaker: Paused in Mic Mode"
+                lang::t("mic.speaker_paused")
             } else {
-                "Speaker: Live (full duplex)"
+                lang::t("mic.speaker_live")
             };
             if ui
                 .add(
@@ -1267,7 +1322,7 @@ impl AudioServerApp {
             .inner_margin(egui::Margin::same(14.0));
         card2.show(ui, |ui| {
             ui.label(
-                egui::RichText::new("MIC SOURCE (PHONE)")
+                egui::RichText::new(lang::t("mic.source_card"))
                     .size(11.0)
                     .color(colors::TEXT_MUTED),
             );
@@ -1286,10 +1341,13 @@ impl AudioServerApp {
                                     .color(colors::TEXT_PRIMARY),
                             );
                             ui.label(
-                                egui::RichText::new(format!("{}Hz · {}ch · PCM 16-bit", sr, ch))
-                                    .size(11.0)
-                                    .monospace()
-                                    .color(colors::TEXT_MUTED),
+                                egui::RichText::new(lang::tf(
+                                    "mic.source_fmt",
+                                    &[("rate", &sr.to_string()), ("ch", &ch.to_string())],
+                                ))
+                                .size(11.0)
+                                .monospace()
+                                .color(colors::TEXT_MUTED),
                             );
                         });
                         // 录制红点
@@ -1316,7 +1374,7 @@ impl AudioServerApp {
                 }
                 None => {
                     ui.label(
-                        egui::RichText::new("Waiting for phone to start mic uplink…")
+                        egui::RichText::new(lang::t("mic.source_waiting"))
                             .size(12.0)
                             .color(colors::TEXT_DISABLED),
                     );
@@ -1345,11 +1403,11 @@ impl AudioServerApp {
                             );
                         });
                     };
-                    cell(ui, format!("{}ms", stats.interval_ms), "chunk");
+                    cell(ui, format!("{}ms", stats.interval_ms), &lang::t("mic.stat_chunk"));
                     ui.add_space(8.0);
-                    cell(ui, format!("{}k", stats.kbps), "kbps uplink");
+                    cell(ui, format!("{}k", stats.kbps), &lang::t("mic.stat_uplink"));
                     ui.add_space(8.0);
-                    cell(ui, format!("{}KB", stats.total_kb), "received");
+                    cell(ui, format!("{}KB", stats.total_kb), &lang::t("mic.stat_received"));
                 });
             }
         });
@@ -1364,7 +1422,7 @@ impl AudioServerApp {
             .inner_margin(egui::Margin::same(14.0));
         card3.show(ui, |ui| {
             ui.label(
-                egui::RichText::new("INJECTION TARGET")
+                egui::RichText::new(lang::t("mic.target_card"))
                     .size(11.0)
                     .color(colors::TEXT_MUTED),
             );
@@ -1372,10 +1430,10 @@ impl AudioServerApp {
             let target = self
                 .mic_engine_device
                 .clone()
-                .unwrap_or_else(|| "not opened (retrying every 3s)".to_string());
+                .unwrap_or_else(|| lang::t("mic.target_none"));
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("Render device")
+                    egui::RichText::new(lang::t("mic.render_device"))
                         .size(13.0)
                         .color(colors::TEXT_SECONDARY),
                 );
@@ -1406,14 +1464,14 @@ impl AudioServerApp {
         // 卡片 1：虚拟摄像头状态 + 双开关（请求 / 强制关闭）
         card.show(ui, |ui| {
             ui.label(
-                egui::RichText::new("VIRTUAL CAMERA")
+                egui::RichText::new(lang::t("cam.virtual_card"))
                     .size(11.0)
                     .color(colors::TEXT_MUTED),
             );
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("Unity Video Capture  ·  OBS Virtual Camera")
+                    egui::RichText::new(lang::t("cam.driver_names"))
                         .size(14.0)
                         .strong()
                         .color(colors::TEXT_PRIMARY),
@@ -1423,14 +1481,14 @@ impl AudioServerApp {
                 if self.cam_live {
                     Self::show_chip(
                         ui,
-                        "LIVE",
+                        &lang::t("cam.chip_live"),
                         egui::Color32::from_rgb(190, 18, 60),
                         egui::Color32::from_rgb(255, 228, 230),
                     );
                 } else if self.cam_session {
                     Self::show_chip(
                         ui,
-                        "STANDBY",
+                        &lang::t("cam.chip_standby"),
                         egui::Color32::from_rgb(4, 120, 87),
                         egui::Color32::from_rgb(236, 253, 245),
                     );
@@ -1438,11 +1496,11 @@ impl AudioServerApp {
             });
             ui.add_space(4.0);
             let hint = if self.cam_live {
-                "An app is watching the virtual camera — the phone camera is ON right now."
+                lang::t("cam.hint_live")
             } else if self.cam_session {
-                "Phone is on standby. Pick \"OBS Virtual Camera\" (browsers/Edge) or \"Unity Video Capture\" (desktop apps) \u{2014} the phone camera starts automatically."
+                lang::t("cam.hint_standby")
             } else {
-                "No phone camera session. Use the request button below \u{2014} the phone asks the user to approve."
+                lang::t("cam.hint_none")
             };
             ui.label(
                 egui::RichText::new(hint)
@@ -1454,7 +1512,7 @@ impl AudioServerApp {
             ui.horizontal(|ui| {
                 let req_enabled = self.client_count > 0;
                 let req = egui::Button::new(
-                    egui::RichText::new("\u{1F4F7} Request Phone Camera")
+                    egui::RichText::new(format!("\u{1F4F7} {}", lang::t("cam.btn_request")))
                         .size(11.0)
                         .color(if req_enabled { colors::ACCENT } else { colors::TEXT_DISABLED }),
                 )
@@ -1466,11 +1524,11 @@ impl AudioServerApp {
                 .rounding(6.0);
                 if ui.add_enabled(req_enabled, req).clicked() {
                     self.send_cmd(ServerCommand::CamRequest);
-                    self.add_log("[Cam] Request sent to phone (awaiting user approval)".to_string());
+                    self.add_log(lang::t("cam.log_request"));
                 }
                 let stop_enabled = self.cam_session;
                 let stop_btn = egui::Button::new(
-                    egui::RichText::new("\u{1F6D1} Force Stop Camera")
+                    egui::RichText::new(format!("\u{1F6D1} {}", lang::t("cam.btn_force_stop")))
                         .size(11.0)
                         .color(if stop_enabled { colors::RED } else { colors::TEXT_DISABLED }),
                 )
@@ -1482,7 +1540,7 @@ impl AudioServerApp {
                 .rounding(6.0);
                 if ui.add_enabled(stop_enabled, stop_btn).clicked() {
                     self.send_cmd(ServerCommand::CamForceStop);
-                    self.add_log("[Cam] Force stop sent — phone camera revoked".to_string());
+                    self.add_log(lang::t("cam.log_force_stop"));
                 }
             });
         });
@@ -1497,7 +1555,7 @@ impl AudioServerApp {
             .inner_margin(egui::Margin::same(14.0));
         card2.show(ui, |ui| {
             ui.label(
-                egui::RichText::new("LIVE PREVIEW (1 FPS)")
+                egui::RichText::new(lang::t("cam.preview_card"))
                     .size(11.0)
                     .color(colors::TEXT_MUTED),
             );
@@ -1520,7 +1578,7 @@ impl AudioServerApp {
                         egui::Sense::hover(),
                     );
                     ui.label(
-                        egui::RichText::new("camera off — waiting for an app to watch")
+                        egui::RichText::new(lang::t("cam.preview_off"))
                             .size(11.0)
                             .color(colors::TEXT_DISABLED),
                     );
@@ -1552,12 +1610,12 @@ impl AudioServerApp {
                     cell(
                         ui,
                         format!("{}×{}", stats.width, stats.height),
-                        "resolution",
+                        &lang::t("cam.stat_resolution"),
                     );
                     ui.add_space(8.0);
-                    cell(ui, format!("{}fps", stats.fps), "uplink fps");
+                    cell(ui, format!("{}fps", stats.fps), &lang::t("cam.stat_fps"));
                     ui.add_space(8.0);
-                    cell(ui, format!("{}k", stats.kbps), "kbps uplink");
+                    cell(ui, format!("{}k", stats.kbps), &lang::t("cam.stat_uplink"));
                 });
             }
         });
@@ -1572,7 +1630,7 @@ impl AudioServerApp {
             .inner_margin(egui::Margin::same(14.0));
         card3.show(ui, |ui| {
             ui.label(
-                egui::RichText::new("CAMERA SOURCE (PHONE)")
+                egui::RichText::new(lang::t("cam.source_card"))
                     .size(11.0)
                     .color(colors::TEXT_MUTED),
             );
@@ -1588,7 +1646,7 @@ impl AudioServerApp {
                 }
                 None => {
                     ui.label(
-                        egui::RichText::new("Waiting for phone to register camera session…")
+                        egui::RichText::new(lang::t("cam.source_waiting"))
                             .size(12.0)
                             .color(colors::TEXT_DISABLED),
                     );
@@ -1600,7 +1658,7 @@ impl AudioServerApp {
                 ui.separator();
                 ui.add_space(8.0);
                 ui.label(
-                    egui::RichText::new("PHONE CAPABILITIES")
+                    egui::RichText::new(lang::t("cam.caps_card"))
                         .size(10.0)
                         .color(colors::TEXT_MUTED),
                 );
@@ -1623,34 +1681,25 @@ impl AudioServerApp {
             .inner_margin(egui::Margin::same(14.0));
         card.show(ui, |ui| {
             ui.label(
-                egui::RichText::new("HOW TO USE")
+                egui::RichText::new(lang::t("cam.how_to_use"))
                     .size(11.0)
                     .color(colors::TEXT_MUTED),
             );
             ui.add_space(6.0);
             ui.label(
-                egui::RichText::new(
-                    "1. Connect the phone app to this server.\n\
-                     2. Enable \"Camera Guardian\" on the phone, or press\n    \
-                       \"Request Phone Camera\" in Connection tab.\n\
-                     3. Pick a webcam in your app:\n    \
-                       \u{2022} Browsers / Edge / Meet \u{2192} \"OBS Virtual Camera\"\n    \
-                       \u{2022} Desktop apps (DingTalk etc.) \u{2192} \"Unity Video Capture\"\n\
-                     4. The phone camera turns ON only while watched,\n    \
-                       and turns OFF the instant the app releases it.",
-                )
-                .size(12.0)
-                .color(colors::TEXT_SECONDARY),
+                egui::RichText::new(lang::t("cam.steps"))
+                    .size(12.0)
+                    .color(colors::TEXT_SECONDARY),
             );
             ui.add_space(10.0);
             ui.label(
-                egui::RichText::new("Drivers: OBS Virtual Camera (browsers) + Unity Video Capture (desktop)")
+                egui::RichText::new(lang::t("cam.drivers_note"))
                     .size(11.0)
                     .monospace()
                     .color(colors::TEXT_MUTED),
             );
             ui.label(
-                egui::RichText::new("Placeholder: 640×480 black frame when no uplink")
+                egui::RichText::new(lang::t("cam.placeholder_note"))
                     .size(11.0)
                     .monospace()
                     .color(colors::TEXT_MUTED),
@@ -1666,16 +1715,122 @@ impl AudioServerApp {
         }
     }
 
+    /// v3.6：语言设置卡片 —— 三种模式的【设置】页底部都会挂上它。
+    /// ----------------------------------------------------------------------------
+    /// 三个按钮 = settings.txt 里 language 的三种取值：
+    ///   auto = 跟随系统（默认） / en = 强制英文 / zh = 强制简体中文
+    /// 点下去立刻生效（egui 每帧重新取文案，下一帧整站换语言），
+    /// 同时写进 exe 同目录的 settings.txt —— 不写注册表，文件删掉就回到默认。
+    fn show_language_card(&mut self, ui: &mut egui::Ui) {
+        let card = egui::Frame::none()
+            .fill(colors::BG_WHITE)
+            .stroke(egui::Stroke::new(1.0_f32, colors::BORDER))
+            .rounding(8.0)
+            .inner_margin(egui::Margin::same(14.0));
+
+        // 当前生效的语言 + 用户在 settings.txt 里存过的选择（用来决定哪个按钮高亮）
+        let current = lang::locale();
+        let saved = lang::saved_choice(&lang::settings_path());
+
+        card.show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(lang::t("settings.language"))
+                        .size(11.0)
+                        .color(colors::TEXT_MUTED),
+                );
+                // 当前真正生效的语言（auto 时 = 系统语言），语言名本身不翻译
+                Self::show_chip(
+                    ui,
+                    lang::display_name(&current),
+                    colors::ACCENT,
+                    colors::ACCENT_BG,
+                );
+            });
+            ui.add_space(8.0);
+
+            let items = [
+                (lang::LanguageChoice::Auto, lang::t("settings.lang_auto")),
+                (lang::LanguageChoice::En, lang::t("settings.lang_en")),
+                (lang::LanguageChoice::Zh, lang::t("settings.lang_zh")),
+            ];
+
+            ui.horizontal(|ui| {
+                for (choice, label) in items {
+                    let active = saved == choice;
+                    let btn = egui::Button::new(
+                        egui::RichText::new(label).size(11.0).color(if active {
+                            colors::ACCENT
+                        } else {
+                            colors::TEXT_SECONDARY
+                        }),
+                    )
+                    .fill(if active { colors::ACCENT_BG } else { colors::BG_LIGHT })
+                    .stroke(egui::Stroke::new(
+                        1.0_f32,
+                        if active {
+                            colors::ACCENT_BORDER
+                        } else {
+                            colors::BORDER
+                        },
+                    ))
+                    .rounding(6.0);
+                    if ui.add(btn).clicked() && !active {
+                        match lang::switch_to(choice) {
+                            Ok(()) => {
+                                self.lang_error = None;
+                                self.add_log(format!(
+                                    "[Lang] switched to {}",
+                                    lang::locale()
+                                ));
+                            }
+                            // 保存失败（例如 exe 放在只读目录）也要让用户看见，
+                            // 不然他会以为切换没生效
+                            Err(e) => {
+                                self.lang_error = Some(lang::tf(
+                                    "settings.lang_save_failed",
+                                    &[("error", &e.to_string())],
+                                ));
+                            }
+                        }
+                    }
+                }
+            });
+
+            ui.add_space(6.0);
+            let hint = lang::tf(
+                "settings.lang_hint",
+                &[("locale", lang::display_name(lang::system_locale()))],
+            );
+            ui.label(
+                egui::RichText::new(hint)
+                    .size(11.0)
+                    .color(colors::TEXT_MUTED),
+            );
+            if let Some(err) = &self.lang_error {
+                ui.label(
+                    egui::RichText::new(err)
+                        .size(11.0)
+                        .color(colors::WARN_TEXT),
+                );
+            }
+        });
+    }
+
     // ── Settings Tab ──
     fn show_settings_tab(&mut self, ui: &mut egui::Ui, is_running: bool) {
         // v3：Mic 模式呈现麦克风设置
         if self.mode == AppMode::Mic {
             self.show_mic_settings_tab(ui);
+            ui.add_space(8.0);
+            self.show_language_card(ui);
             return;
         }
         // v3.4：Camera 模式呈现摄像头设置（设备名提示 + 待命说明）
         if self.mode == AppMode::Camera {
             self.show_camera_settings_tab(ui);
+            ui.add_space(8.0);
+            self.show_language_card(ui);
             return;
         }
         // 运行时锁定提示
@@ -1691,7 +1846,7 @@ impl AudioServerApp {
                     ui.label(egui::RichText::new("\u{26A0}").size(14.0).color(colors::WARN_TEXT));
                     ui.add_space(6.0);
                     ui.label(
-                        egui::RichText::new("Stop the server to change settings.")
+                        egui::RichText::new(lang::t("settings.warn_running"))
                             .size(12.0)
                             .color(colors::WARN_TEXT),
                     );
@@ -1709,7 +1864,7 @@ impl AudioServerApp {
 
         audio_frame.show(ui, |ui| {
             ui.label(
-                egui::RichText::new("AUDIO")
+                egui::RichText::new(lang::t("settings.audio"))
                     .size(11.0)
                     .color(colors::TEXT_MUTED),
             );
@@ -1720,7 +1875,7 @@ impl AudioServerApp {
                     .spacing([8.0, 6.0])
                     .show(ui, |ui| {
                         ui.label(
-                            egui::RichText::new("Sample Rate")
+                            egui::RichText::new(lang::t("settings.sample_rate"))
                                 .size(13.0)
                                 .color(colors::TEXT_SECONDARY),
                         );
@@ -1737,7 +1892,7 @@ impl AudioServerApp {
                         ui.end_row();
 
                         ui.label(
-                            egui::RichText::new("Channels")
+                            egui::RichText::new(lang::t("settings.channels"))
                                 .size(13.0)
                                 .color(colors::TEXT_SECONDARY),
                         );
@@ -1754,7 +1909,7 @@ impl AudioServerApp {
                         ui.end_row();
 
                         ui.label(
-                            egui::RichText::new("Buffer Size")
+                            egui::RichText::new(lang::t("settings.buffer_size"))
                                 .size(13.0)
                                 .color(colors::TEXT_SECONDARY),
                         );
@@ -1784,7 +1939,7 @@ impl AudioServerApp {
 
         net_frame.show(ui, |ui| {
             ui.label(
-                egui::RichText::new("NETWORK")
+                egui::RichText::new(lang::t("settings.network"))
                     .size(11.0)
                     .color(colors::TEXT_MUTED),
             );
@@ -1795,7 +1950,7 @@ impl AudioServerApp {
                     .spacing([8.0, 6.0])
                     .show(ui, |ui| {
                         ui.label(
-                            egui::RichText::new("Port")
+                            egui::RichText::new(lang::t("settings.port"))
                                 .size(13.0)
                                 .color(colors::TEXT_SECONDARY),
                         );
@@ -1813,6 +1968,9 @@ impl AudioServerApp {
                     });
             });
         });
+
+        ui.add_space(8.0);
+        self.show_language_card(ui);
     }
 
     // ── v3：Mic 模式 Settings Tab ──
@@ -1825,14 +1983,14 @@ impl AudioServerApp {
 
         card.show(ui, |ui| {
             ui.label(
-                egui::RichText::new("BEHAVIOR")
+                egui::RichText::new(lang::t("settings.behavior"))
                     .size(11.0)
                     .color(colors::TEXT_MUTED),
             );
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("Pause speaker while mic live")
+                    egui::RichText::new(lang::t("settings.pause_speaker"))
                         .size(13.0)
                         .color(colors::TEXT_SECONDARY),
                 );
@@ -1846,11 +2004,9 @@ impl AudioServerApp {
             });
             ui.add_space(4.0);
             ui.label(
-                egui::RichText::new(
-                    "Off (default): playback and mic run at the same time (full duplex).",
-                )
-                .size(11.0)
-                .color(colors::TEXT_MUTED),
+                egui::RichText::new(lang::t("settings.pause_speaker_hint"))
+                    .size(11.0)
+                    .color(colors::TEXT_MUTED),
             );
         });
 
@@ -1863,7 +2019,7 @@ impl AudioServerApp {
             .inner_margin(egui::Margin::same(14.0));
         card2.show(ui, |ui| {
             ui.label(
-                egui::RichText::new("UPLINK FORMAT (SET BY PHONE)")
+                egui::RichText::new(lang::t("settings.uplink_format"))
                     .size(11.0)
                     .color(colors::TEXT_MUTED),
             );
@@ -1874,7 +2030,7 @@ impl AudioServerApp {
             };
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("Sample Rate")
+                    egui::RichText::new(lang::t("settings.sample_rate"))
                         .size(13.0)
                         .color(colors::TEXT_SECONDARY),
                 );
@@ -1887,7 +2043,7 @@ impl AudioServerApp {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("Channels")
+                    egui::RichText::new(lang::t("settings.channels"))
                         .size(13.0)
                         .color(colors::TEXT_SECONDARY),
                 );
@@ -1899,11 +2055,9 @@ impl AudioServerApp {
             });
             ui.add_space(6.0);
             ui.label(
-                egui::RichText::new(
-                    "Keep phone at 48kHz mono to match the CABLE mix format.",
-                )
-                .size(11.0)
-                .color(colors::TEXT_MUTED),
+                egui::RichText::new(lang::t("settings.uplink_hint"))
+                    .size(11.0)
+                    .color(colors::TEXT_MUTED),
             );
         });
     }
@@ -1913,7 +2067,7 @@ impl AudioServerApp {
         // 工具栏
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new("RUNTIME LOG")
+                egui::RichText::new(lang::t("log.runtime"))
                     .size(11.0)
                     .color(colors::TEXT_MUTED),
             );
@@ -1921,7 +2075,7 @@ impl AudioServerApp {
                 if ui
                     .add(
                         egui::Button::new(
-                            egui::RichText::new("Clear").size(11.0).color(colors::RED),
+                            egui::RichText::new(lang::t("log.clear")).size(11.0).color(colors::RED),
                         )
                         .fill(colors::RED_BG)
                         .stroke(egui::Stroke::new(1.0_f32, colors::RED_BORDER))
@@ -1951,7 +2105,7 @@ impl AudioServerApp {
                 .show(ui, |ui| {
                     if self.logs.is_empty() {
                         ui.label(
-                            egui::RichText::new("No logs yet")
+                            egui::RichText::new(lang::t("log.empty"))
                                 .size(12.0)
                                 .color(colors::TEXT_DISABLED),
                         );
@@ -2007,9 +2161,7 @@ impl eframe::App for AudioServerApp {
                 GuideAction::Ready => {
                     // 驱动装好了：撤掉门禁，此刻才真正启动服务端
                     self.env_gate = None;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Title(
-                        "Audio Server".to_string(),
-                    ));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Title(lang::t("app.title")));
                     self.start_server();
                     ctx.request_repaint();
                 }

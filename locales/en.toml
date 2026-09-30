@@ -1,0 +1,176 @@
+# ============================================================================
+# AudioServer 界面文案 —— 英文（fallback 语言，缺键时全界面回退到这里）
+# ----------------------------------------------------------------------------
+# · 键名 = 代码里的 t("section.key")
+# · {name} 是占位符，由 i18n::tf() 在运行时替换（不用 rust-i18n 的 %{name}，
+#   因为我们的 key 是运行时变量，走不了它编译期插值的宏）
+# · 必须和 zh.toml 一一对应；改这里就顺手改那边，单测 i18n_key_parity 会盯住
+# · WiFi / USB / IP / WebSocket / PCM / Hz / kbps / fps 这类全球通用缩写不翻译，
+#   两边保持同字（见 zh.toml 同键）
+# ============================================================================
+
+[app]
+title = "Audio Server"
+title_gate = "Audio Server —— First run: drivers needed"
+
+[header]
+stopped = "Server Stopped"
+running = "Server Running"
+toggle_to_start = "Toggle to start"
+uptime = "Uptime {uptime}"
+mic_live = "Mic Live"
+mic_muted = "Mic Muted"
+mic_standby = "Mic Standby"
+mic_idle = "Mic Idle"
+cam_live = "Cam Live"
+cam_standby = "Cam Standby"
+cam_idle = "Cam Idle"
+mic_sub_live = "Phone → CABLE · Uptime {uptime}"
+mic_sub_standby = "Phone on standby · speaks when any app opens the mic"
+mic_sub_idle = "Waiting for phone connection"
+cam_sub_live = "Phone → Unity Video Capture · Uptime {uptime}"
+cam_sub_standby = "Phone on standby · opens camera when any app watches it"
+cam_sub_idle = "Waiting for phone camera session"
+
+[mode]
+speaker = "Speaker Mode"
+microphone = "Microphone Mode"
+camera = "Camera Mode"
+
+[tabs]
+connection = "Connection"
+settings = "Settings"
+log = "Log"
+
+[footer]
+idle = "Idle"
+audio_summary = "{rate}Hz · {ch}ch · PCM"
+mic_summary = "{rate}Hz · {ch}ch · MIC"
+mic_summary_idle = "48kHz · 1ch · MIC (idle)"
+cam_summary = "{w}×{h} · {fps}fps · CAM"
+cam_summary_idle = "CAM (idle)"
+
+[conn]
+wifi = "WiFi LAN"
+usb = "USB"
+bluetooth = "Bluetooth"
+info = "CONNECTION INFO"
+local_ip = "Local IP"
+copy = "Copy"
+websocket = "WebSocket"
+clients = "Connected Clients"
+waiting = "Waiting..."
+
+[mic]
+virtual_card = "VIRTUAL MICROPHONE"
+phone_mic = "Phone Mic (VB-CABLE)"
+chip_ready = "READY"
+chip_driver_needed = "DRIVER NEEDED"
+chip_live = "LIVE"
+chip_muted = "MUTED"
+chip_standby = "STANDBY"
+hint_ready = "PC apps: select \"CABLE Output\" as input device — phone mic is live automatically."
+hint_missing = "VB-CABLE playback device not found. Install VB-Audio Virtual Cable, then restart."
+speaker_paused = "Speaker: Paused in Mic Mode"
+speaker_live = "Speaker: Live (full duplex)"
+source_card = "MIC SOURCE (PHONE)"
+source_waiting = "Waiting for phone to start mic uplink…"
+source_fmt = "{rate}Hz · {ch}ch · PCM 16-bit"
+stat_chunk = "chunk"
+stat_uplink = "kbps uplink"
+stat_received = "received"
+target_card = "INJECTION TARGET"
+render_device = "Render device"
+target_none = "not opened (retrying every 3s)"
+
+[cam]
+virtual_card = "VIRTUAL CAMERA"
+driver_names = "Unity Video Capture  ·  OBS Virtual Camera"
+chip_live = "LIVE"
+chip_standby = "STANDBY"
+hint_live = "An app is watching the virtual camera — the phone camera is ON right now."
+hint_standby = "Phone is on standby. Pick \"OBS Virtual Camera\" (browsers/Edge) or \"Unity Video Capture\" (desktop apps) — the phone camera starts automatically."
+hint_none = "No phone camera session. Use the request button below — the phone asks the user to approve."
+btn_request = "Request Phone Camera"
+btn_force_stop = "Force Stop Camera"
+log_request = "[Cam] Request sent to phone (awaiting user approval)"
+log_force_stop = "[Cam] Force stop sent — phone camera revoked"
+preview_card = "LIVE PREVIEW (1 FPS)"
+preview_off = "camera off — waiting for an app to watch"
+stat_resolution = "resolution"
+stat_fps = "uplink fps"
+stat_uplink = "kbps uplink"
+source_card = "CAMERA SOURCE (PHONE)"
+source_waiting = "Waiting for phone to register camera session…"
+caps_card = "PHONE CAPABILITIES"
+how_to_use = "HOW TO USE"
+steps = "1. Connect the phone app to this server.\n2. Enable \"Camera Guardian\" on the phone, or press\n    \"Request Phone Camera\" in Connection tab.\n3. Pick a webcam in your app:\n    • Browsers / Edge / Meet → \"OBS Virtual Camera\"\n    • Desktop apps (DingTalk etc.) → \"Unity Video Capture\"\n4. The phone camera turns ON only while watched,\n    and turns OFF the instant the app releases it."
+drivers_note = "Drivers: OBS Virtual Camera (browsers) + Unity Video Capture (desktop)"
+placeholder_note = "Placeholder: 640×480 black frame when no uplink"
+
+[settings]
+warn_running = "Stop the server to change settings."
+audio = "AUDIO"
+sample_rate = "Sample Rate"
+channels = "Channels"
+buffer_size = "Buffer Size"
+network = "NETWORK"
+port = "Port"
+behavior = "BEHAVIOR"
+pause_speaker = "Pause speaker while mic live"
+pause_speaker_hint = "Off (default): playback and mic run at the same time (full duplex)."
+uplink_format = "UPLINK FORMAT (SET BY PHONE)"
+uplink_hint = "Keep phone at 48kHz mono to match the CABLE mix format."
+language = "LANGUAGE"
+lang_auto = "Follow system"
+lang_en = "English"
+lang_zh = "简体中文"
+lang_hint = "System language detected: {locale}. Your choice is saved to settings.txt next to the exe."
+lang_save_failed = "Could not save settings.txt ({error}) — the switch still works until you restart."
+
+[log]
+runtime = "RUNTIME LOG"
+clear = "Clear"
+empty = "No logs yet"
+
+[guide]
+title = "First run: drivers needed"
+intro = "This program is one portable file: it writes nothing to the registry, ships no install\nscript and never installs anything for you.\nBut using the phone as a PC microphone / camera needs virtual drivers inside Windows. While\nthey are missing this program will not start the server at all — otherwise you would only\nfind out there is no device after the phone had already connected.\nInstall what is marked red below, then press [Re-check] to enter the main window."
+vb_title = "VB-CABLE virtual audio cable  [required for Mic Mode]"
+vb_ok = "CABLE Input / CABLE Output found in the device list"
+vb_missing = "No CABLE Input / CABLE Output in the PC sound-device list"
+vb_btn = "Open the VB-CABLE download page"
+vb_hover = "Download VB-CABLE's Driver.exe and run it as administrator"
+vb_steps = "Steps: download → right-click \"Run as administrator\" → a reboot afterwards is recommended;\nthen set your meeting app's [input device] to CABLE Output."
+cam_title = "Virtual camera driver  [required for Camera Mode, either one]"
+cam_both = "Both present: desktop apps use Unity Video Capture, browsers use OBS Virtual Camera"
+cam_unity_only = "Unity Video Capture is installed (browsers only accept OBS Virtual Camera — add OBS when needed)"
+cam_obs_only = "OBS Virtual Camera is installed, ready to use"
+cam_none = "Neither is installed: the phone picture cannot become a PC webcam"
+cam_btn_obs = "Open the OBS Studio download page"
+cam_hover_obs = "The easiest route: install OBS Studio, it ships OBS Virtual Camera"
+cam_btn_unity = "Open the Unity Capture project page"
+cam_hover_unity = "After downloading and unzipping: right-click Install\\Install.bat and run it as administrator"
+cam_note = "This program will not install any driver for you and ships no install script — it only\ndetects and tells you what is missing.\nThe difference between the two drivers: Unity is a DirectShow filter, selectable in\nDingTalk / Tencent Meeting / OBS; Edge and Chrome browsers only accept OBS Virtual Camera\n(install OBS and it is there, no extra configuration)."
+fs_running = "Windows Camera Frame Server is running"
+fs_stopped = "Note: Windows Camera Frame Server is not running. Browsers will see zero cameras\n(services.msc → Windows Camera Frame Server → Start). Desktop meeting apps are unaffected."
+fs_unknown = "Could not query the Windows Camera Frame Server status (does not affect usage)"
+devices_show = "Show detected audio devices"
+devices_hide = "Hide device details"
+status_opened = "Download page opened: install the driver, then press [Re-check]"
+status_cam_opened = "Installed already? Press [Re-check] to enter the main window"
+status_ready = "Environment OK — entering the main window…"
+status_missing = "Still missing {count} item(s): {items}"
+quit = "Quit"
+recheck = "Re-check"
+missing_vb = "VB-CABLE virtual audio cable (required for Mic Mode)"
+missing_cam = "Virtual camera driver: Unity Capture or OBS Virtual Camera (either one)"
+
+[cli]
+check_failed = "=== Audio Server (CLI) startup check failed ==="
+missing = "  missing: {item}"
+no_install = "  This program ships no driver and runs no install script. Download and install yourself:"
+vb_url = "  VB-CABLE: https://vb-audio.com/Cable/"
+obs_url = "  OBS Studio (has OBS Virtual Camera): https://obsproject.com/download"
+unity_url = "  Unity Capture: https://github.com/Unity-Technologies/Unity-Capture"
+force_hint = "(If you know what you are doing, add --skip-env-check to start anyway)"

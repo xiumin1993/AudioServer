@@ -33,6 +33,7 @@ local-ip-address = "0.6"
 
 # CLI 参数 (仅 server 二进制使用)
 clap = { version = "4.5", features = ["derive"] }
+rust-i18n = "4.2.4"
 
 # ===== 以下是真正的 Windows 专属依赖（TOML 分节规则：表格标题到下一个标题为止）=====
 # v3.5 修复：以前这些跨平台依赖误写在本节内部，导致 Mac 目标 cargo check 全部找不到 crate
@@ -53,6 +54,8 @@ windows = { version = "0.58", features = [
     "Win32_System_Com_StructuredStorage",
     # v3.4 双通道：OBS 虚拟摄像头通道用隐私监控注册表检测"有应用正在看摄像头"
     "Win32_System_Registry",
+    # i18n：读系统显示语言（GetUserDefaultUILanguage），决定界面默认中/英
+    "Win32_Globalization",
 ] }
 
 # ===== macOS 专属依赖（v3.5 Mac 移植）=====

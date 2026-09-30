@@ -33,6 +33,8 @@
 use eframe::egui;
 use std::process::Command;
 
+use crate::lang;
+
 /// 一次自检的结果快照（全部只读，不改系统任何东西）
 #[derive(Clone)]
 pub struct EnvReport {
@@ -70,14 +72,14 @@ impl EnvReport {
         self.skipped || (self.vb_cable && (self.unity || self.obs))
     }
 
-    /// 还缺哪些必需项（CLI 版 server 用它打印缺项后退出）
-    pub fn missing(&self) -> Vec<&'static str> {
+    /// 还缺哪些必需项（CLI 版 server 用它打印缺项后退出；文案按当前语言取）
+    pub fn missing(&self) -> Vec<String> {
         let mut v = Vec::new();
         if !self.vb_cable {
-            v.push("VB-CABLE 虚拟音频线（麦克风模式必需）");
+            v.push(lang::t("guide.missing_vb"));
         }
         if !self.unity && !self.obs {
-            v.push("虚拟摄像头驱动：Unity Capture 或 OBS Virtual Camera（任一即可）");
+            v.push(lang::t("guide.missing_cam"));
         }
         v
     }
@@ -286,20 +288,30 @@ impl EnvGuide {
     }
 
     /// 主窗口标题：让任务栏/标题栏一眼看出"这是准备页，还没开服务"
-    pub fn viewport_title(&self) -> &'static str {
-        "Audio Server —— 首次运行：需要准备驱动"
+    pub fn viewport_title(&self) -> String {
+        lang::t("app.title_gate")
     }
 
     /// 重新检测：齐了返回 Ready（调用方起服务），否则刷新页面并把结果写日志
     fn recheck(&mut self) -> GuideAction {
         self.report = detect();
         self.status = if self.report.ready() {
-            "环境已就绪，正在进入主界面…".to_string()
+            lang::t("guide.status_ready")
         } else {
             let miss = self.report.missing();
-            format!("仍然缺少 {} 项：{}", miss.len(), miss.join("、"))
+            lang::tf(
+                "guide.status_missing",
+                &[
+                    ("count", &miss.len().to_string()),
+                    ("items", &miss.join(" / ")),
+                ],
+            )
         };
-        log::info!("[EnvCheck] recheck ready={} ({})", self.report.ready(), self.status);
+        log::info!(
+            "[EnvCheck] recheck ready={} ({})",
+            self.report.ready(),
+            self.status
+        );
         if self.report.ready() {
             GuideAction::Ready
         } else {
@@ -323,7 +335,7 @@ impl EnvGuide {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if ui
-                        .button(egui::RichText::new("退出程序").size(14.0))
+                        .button(egui::RichText::new(lang::t("guide.quit")).size(14.0))
                         .clicked()
                     {
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
@@ -334,7 +346,7 @@ impl EnvGuide {
                             .button(
                                 // 注意：本项目是浅色主题，按钮底色是白的，
                                 // 这里若把文字也写成白色就等于隐形（第一版踩过）。
-                                egui::RichText::new("重新检测")
+                                egui::RichText::new(lang::t("guide.recheck"))
                                     .size(16.0)
                                     .strong()
                                     .color(egui::Color32::from_rgb(37, 99, 235)),
@@ -354,19 +366,11 @@ impl EnvGuide {
             .frame(egui::Frame::none())
             .show_inside(ui, |ui| {
                 ui.label(
-                    egui::RichText::new("首次运行：需要准备驱动")
+                    egui::RichText::new(lang::t("guide.title"))
                         .size(20.0)
                         .strong(),
                 );
-                ui.label(
-                    egui::RichText::new(
-                        "本程序是绿色单文件：不写注册表、不附带安装脚本、也不会替你装任何东西。\n\
-                         但手机当电脑麦克风/摄像头要靠系统里的虚拟驱动，缺这些驱动时\n\
-                         程序不会启动服务端，免得连上手机才发现选不到设备。\n\
-                         请自己按下面的说明装好，回来点【重新检测】即可进入主界面。",
-                    )
-                    .size(13.0),
-                );
+                ui.label(egui::RichText::new(lang::t("guide.intro")).size(13.0));
                 ui.add_space(10.0);
                 ui.separator();
                 ui.add_space(8.0);
@@ -382,30 +386,20 @@ impl EnvGuide {
                 item_row(
                     ui,
                     vb_ok,
-                    "VB-CABLE 虚拟音频线　【麦克风模式必需】",
-                    if vb_ok {
-                        "已检测到 CABLE Input / CABLE Output 设备"
-                    } else {
-                        "电脑声卡列表里没有 CABLE Input / CABLE Output"
-                    },
+                    &lang::t("guide.vb_title"),
+                    &lang::t(if vb_ok { "guide.vb_ok" } else { "guide.vb_missing" }),
                 );
                 if !vb_ok {
                     ui.indent("vb", |ui| {
                         if ui
-                            .button("打开 VB-CABLE 官网下载页")
-                            .on_hover_text("下载 VB-CABLE 的 Driver.exe，右键以管理员身份运行")
+                            .button(lang::t("guide.vb_btn"))
+                            .on_hover_text(lang::t("guide.vb_hover"))
                             .clicked()
                         {
                             open_url("https://vb-audio.com/Cable/");
-                            self.status = "已打开下载页：装完驱动回来点【重新检测】".to_string();
+                            self.status = lang::t("guide.status_opened");
                         }
-                        ui.label(
-                            egui::RichText::new(
-                                "步骤：下载 → 右键\"以管理员身份运行\" → 装完建议重启一次电脑；\n\
-                                 之后会议软件把【输入设备】选成 CABLE Output 即可。",
-                            )
-                            .size(12.0),
-                        );
+                        ui.label(egui::RichText::new(lang::t("guide.vb_steps")).size(12.0));
                     });
                 }
                 ui.add_space(10.0);
@@ -413,66 +407,44 @@ impl EnvGuide {
                 // ② 虚拟摄像头 —— 两选一
                 let cam_ok = self.report.unity || self.report.obs;
                 let detail = match (self.report.unity, self.report.obs) {
-                    (true, true) => {
-                        "两个都在：桌面软件用 Unity Video Capture，浏览器用 OBS Virtual Camera"
-                            .to_string()
-                    }
-                    (true, false) => {
-                        "已装 Unity Video Capture（浏览器只认 OBS Virtual Camera，需要时再装 OBS）"
-                            .to_string()
-                    }
-                    (false, true) => "已装 OBS Virtual Camera，可直接用".to_string(),
-                    (false, false) => "两个都没装：手机画面无法变成电脑摄像头".to_string(),
+                    (true, true) => lang::t("guide.cam_both"),
+                    (true, false) => lang::t("guide.cam_unity_only"),
+                    (false, true) => lang::t("guide.cam_obs_only"),
+                    (false, false) => lang::t("guide.cam_none"),
                 };
-                item_row(
-                    ui,
-                    cam_ok,
-                    "虚拟摄像头驱动　【摄像头模式必需，二选一】",
-                    &detail,
-                );
+                item_row(ui, cam_ok, &lang::t("guide.cam_title"), &detail);
                 if !cam_ok {
                     ui.indent("cam", |ui| {
                         let mut opened = false;
                         if ui
-                            .button("打开 OBS Studio 下载页")
-                            .on_hover_text("最简单的一路：装 OBS Studio，自带 OBS Virtual Camera")
+                            .button(lang::t("guide.cam_btn_obs"))
+                            .on_hover_text(lang::t("guide.cam_hover_obs"))
                             .clicked()
                         {
                             open_url("https://obsproject.com/download");
                             opened = true;
                         }
                         if ui
-                            .button("打开 Unity Capture 项目主页")
-                            .on_hover_text(
-                                "下载解压后，进 Install 文件夹右键\"以管理员身份运行\" Install.bat",
-                            )
+                            .button(lang::t("guide.cam_btn_unity"))
+                            .on_hover_text(lang::t("guide.cam_hover_unity"))
                             .clicked()
                         {
                             open_url("https://github.com/Unity-Technologies/Unity-Capture");
                             opened = true;
                         }
                         if opened {
-                            self.status = "已打开下载页：装好后回来点【重新检测】".to_string();
+                            self.status = lang::t("guide.status_cam_opened");
                         }
-                        ui.label(
-                            egui::RichText::new(
-                                "本程序不会替你安装任何驱动，也不附带安装脚本 —— 只负责检测并提示。\n\
-                                 两个驱动的区别：Unity 是 DirectShow 滤镜，钉钉/腾讯会议/OBS 能选到；\n\
-                                 Edge/Chrome 浏览器只认 OBS Virtual Camera（装了 OBS 就有，无需额外配置）。",
-                            )
-                            .size(12.0),
-                        );
+                        ui.label(egui::RichText::new(lang::t("guide.cam_note")).size(12.0));
                     });
                 }
                 ui.add_space(10.0);
 
                 // ③ FrameServer —— 仅提示，不参与放行
                 let fs_txt = match self.report.frameserver_running {
-                    Some(true) => "Windows 相机框架服务（FrameServer）正在运行".to_string(),
-                    Some(false) => "提示：Windows 相机框架服务没在跑。浏览器会一个摄像头都看不到\n\
-                     （services.msc → Windows Camera Frame Server → 启动）。桌面会议软件不受影响。"
-                        .to_string(),
-                    None => "未能查询 Windows 相机框架服务状态（不影响使用）".to_string(),
+                    Some(true) => lang::t("guide.fs_running"),
+                    Some(false) => lang::t("guide.fs_stopped"),
+                    None => lang::t("guide.fs_unknown"),
                 };
                 ui.label(
                     egui::RichText::new(fs_txt)
@@ -489,7 +461,11 @@ impl EnvGuide {
                 if !self.report.audio_devices.is_empty() {
                     let open = self.show_devices;
                     if ui
-                        .small_button(if open { "收起设备明细" } else { "查看检测到的音频设备" })
+                        .small_button(if open {
+                            lang::t("guide.devices_hide")
+                        } else {
+                            lang::t("guide.devices_show")
+                        })
                         .clicked()
                     {
                         self.show_devices = !open;

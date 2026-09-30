@@ -37,23 +37,26 @@ async fn main() -> Result<()> {
         .format_timestamp_millis()
         .init();
 
+    // CLI 版没有界面可点，语言由环境变量 / settings.txt / 系统语言决定（与 GUI 同一套优先级）
+    let (locale, locale_from) = audioserver::lang::apply_startup_locale();
+    log::info!("[CLI] UI language = {locale} (from {locale_from})");
+
     let args = Args::parse();
 
     // ── v3.5：启动环境门禁（只读检测，不写注册表、不装驱动）──
     if !args.skip_env_check {
         let report = audioserver::env_check::detect();
         if !report.ready() {
-            eprintln!("=== Audio Server (CLI) 启动前自检未通过 ===");
+            use audioserver::lang;
+            eprintln!("{}", lang::t("cli.check_failed"));
             for m in report.missing() {
-                eprintln!("  缺少：{m}");
+                eprintln!("{}", lang::tf("cli.missing", &[("item", &m)]));
             }
-            eprintln!(
-                "\n  本程序不附带、也不运行任何驱动安装脚本，请自行下载后按官方说明安装：\n  \
-                 VB-CABLE：https://vb-audio.com/Cable/\n  \
-                 OBS Studio（自带 OBS Virtual Camera）：https://obsproject.com/download\n  \
-                 Unity Capture：https://github.com/Unity-Technologies/Unity-Capture"
-            );
-            eprintln!("\n（确认知道自己在做什么时，可加 --skip-env-check 强行启动）");
+            eprintln!("\n{}", lang::t("cli.no_install"));
+            eprintln!("{}", lang::t("cli.vb_url"));
+            eprintln!("{}", lang::t("cli.obs_url"));
+            eprintln!("{}", lang::t("cli.unity_url"));
+            eprintln!("\n{}", lang::t("cli.force_hint"));
             std::process::exit(2);
         }
     }

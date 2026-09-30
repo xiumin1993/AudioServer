@@ -166,6 +166,8 @@ struct ClientManager {
     cam_mailbox_obs: FrameMailbox,
     /// 手机已登记摄像头会话（cam_start），准备接收二进制帧
     cam_session: Arc<AtomicBool>,
+    /// v3.4.5：记录哪个 client_key 拥有摄像头会话（防止重连时旧连接清理误清新连接状态）
+    cam_session_owner: Arc<Mutex<Option<String>>>,
     /// 有应用正在观看虚拟摄像头（vcam 引擎上报），驱动 cam_state 广播
     cam_live: Arc<AtomicBool>,
     /// 双通道各自的活跃信号：cam_live = unity || obs（任一设备被占用就唤醒手机）
@@ -188,6 +190,7 @@ impl ClientManager {
                 cam_mailbox: vcam::new_mailbox(),
                 cam_mailbox_obs: vcam::new_mailbox(),
                 cam_session: Arc::new(AtomicBool::new(false)),
+                cam_session_owner: Arc::new(Mutex::new(None)),
                 cam_live: Arc::new(AtomicBool::new(false)),
                 cam_live_unity: Arc::new(AtomicBool::new(false)),
                 cam_live_obs: Arc::new(AtomicBool::new(false)),
@@ -913,6 +916,7 @@ async fn handle_connection(
     let mic_muted_recv = client_manager.mic_muted.clone();
     // v3.4：摄像头会话/占用标志（跨任务共享）
     let cam_session_recv = client_manager.cam_session.clone();
+    let cam_session_owner_recv = client_manager.cam_session_owner.clone();
     let cam_live_recv = client_manager.cam_live.clone();
     let recv_task = tokio::spawn(async move {
         // Mic 会话状态（未收到 mic_start 前行为与 v2 完全相同）
@@ -1029,6 +1033,8 @@ async fn handle_connection(
                     } else if compact.contains("\"type\":\"cam_start\"") {
                         // 手机相机硬件已打开、开始推 JPEG 帧（或待命登记，语义同 mic_start）
                         cam_session_recv.store(true, Ordering::Relaxed);
+                        // v3.4.5：记录本连接为会话所有者（防止重连时旧连接清理误清新连接状态）
+                        *cam_session_owner_recv.lock().await = Some(key_recv.clone());
                         // 回执附带当前占用状态：若应用已在观看，手机保持推流；
                         // 若无人观看，手机可回到"硬件关闭"待命，等 cam_state 唤醒
                         let live_now = cam_live_recv.load(Ordering::Relaxed);
@@ -1052,6 +1058,8 @@ async fn handle_connection(
                     } else if compact.contains("\"type\":\"cam_stop\"") {
                         // 手机端主动结束摄像头会话（或手机端确认关闭）
                         cam_session_recv.store(false, Ordering::Relaxed);
+                        // v3.4.5：清除会话所有者
+                        *cam_session_owner_recv.lock().await = None;
                         if let Ok(mut mb) = mgr_recv.cam_mailbox.lock() {
                             *mb = None;
                         }
@@ -1165,7 +1173,13 @@ async fn handle_connection(
                 .ok();
         }
         // v3.4：摄像头会话同样随连接结束而终止，清空邮箱并复位 GUI
-        if cam_session_recv.swap(false, Ordering::Relaxed) {
+        // v3.4.5：只有当本连接仍是会话所有者时才清理（防止重连时旧连接清理误清新连接状态）
+        let is_owner = {
+            let owner = cam_session_owner_recv.lock().await;
+            owner.as_ref() == Some(&key_recv)
+        };
+        if is_owner && cam_session_recv.swap(false, Ordering::Relaxed) {
+            *cam_session_owner_recv.lock().await = None;
             if let Ok(mut mb) = mgr_recv.cam_mailbox.lock() {
                 *mb = None;
             }

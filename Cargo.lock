@@ -497,6 +497,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "core-foundation-sys",
+ "coreaudio-sys",
  "cpal",
  "eframe",
  "env_logger",

@@ -340,10 +340,17 @@ mod windows_impl {
             // 一次性从队列取需要的帧数样本，不足补静音
             let frames = available as usize;
             let mut mono: Vec<i16> = Vec::with_capacity(frames);
+            // 本轮到底有没有拿到真实上行音频。下面节流要用：
+            // 有真实音频时【绝不许睡觉】（睡了就是录音延迟），
+            // 只有"纯写静音保活"的那种空转才需要被限速。
+            // 这里故意不写初始值：下面那个块一定会赋值，写了 rustc 反而报
+            // "value assigned is never read"。
+            let had_uplink;
             {
                 let urate = UPLINK_RATE.load(std::sync::atomic::Ordering::Relaxed);
                 let resample = urate != stream.sample_rate && urate >= 8000;
                 let mut q = queue.lock().unwrap();
+                had_uplink = !q.is_empty();
                 if !resample {
                     // 常见路径：速率一致，直接逐样本搬运（与旧版完全相同）
                     for _ in 0..frames {
@@ -408,6 +415,20 @@ mod windows_impl {
                 if render.ReleaseBuffer(available, 0).is_err() {
                     return;
                 }
+            }
+            // ── v3.7 CPU 修复：给"没人听的静音泵"限速 ─────────────────────
+            // 这个循环原本【整条写入路径上没有任何节流】，只靠 WASAPI 的
+            // padding 天然阻塞。问题是：只要没有应用把 CABLE Output 当麦克风
+            // 录音（手机断开时就是常态），音频引擎根本不向前推进，
+            // GetCurrentPadding() 永远返回 0 → available 恒等于整个缓冲区
+            // → 于是以极限速度反复写同一份静音，实测白烧 100% 一个核心
+            // （任务管理器里 audioserver 常年 14~16%，电源计划判"非常高"）。
+            //
+            // 只在"本轮没取到真实上行音频"时歇 2ms：
+            //   · 静音保活路径 500 轮/秒封顶，CPU 直接归零到百分之一以下；
+            //   · 真实录音路径 had_uplink=true，一行都不睡，延迟完全不变。
+            if !had_uplink {
+                std::thread::sleep(std::time::Duration::from_millis(2));
             }
         }
     }

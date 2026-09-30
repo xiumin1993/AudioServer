@@ -9,10 +9,29 @@
 //   - 接收端（驱动）创建：Mutex "UnityCapture_Mutx"、Sent 事件、Data 内存映射
 //   - 发送端（我们）创建：Want 事件；其余全部是"打开已存在的对象"
 //   - 握手：filter 每要一帧就 SetEvent(Want)；我们写完一帧 SetEvent(Sent)
-//   - 共享内存头布局（共 32 字节，图像数据从偏移 32 开始）：
-//       [0] maxSize  [4] width  [8] height  [12] stride(像素)
-//       [16] format  [20] resizemode  [24] mirrormode  [28] timeout
-//   - format=0 (FORMAT_UINT8)：每像素 4 字节，RGBA 顺序
+//   - 共享内存头布局（8 个 4 字节整数 = 32 字节，图像数据从偏移 32 开始，
+//     与 shared.inl 的 SharedMemHeader 逐字段对齐）：
+//       [0] maxSize  [4] width  [8] height  [12] stride  [16] format
+//       [20] resizemode  [24] mirrormode  [28] timeout
+//   - format=0 (FORMAT_UINT8)：每像素 4 字节，RGBA 顺序（filter 负责换成 BGR(A)）
+//
+// ★★ v3.4.11 花屏根因（两处字段单位/取值写错，逐条对照驱动源码）：
+//   1) stride 的单位是【像素/行】，不是字节。
+//      filter 的拷贝函数把源缓冲当 uint32_t* 处理：
+//        UnityCaptureFilter.cpp:190/227 → src = BufIn + RowStart * RGBAInStride
+//      官方发送端 UnityCapturePlugin.cpp:134 传的是 `RowPitch / 4`（除 bpp）。
+//      我们以前写 w*4（字节），filter 理解为"每行 w*4 个像素" → 每行多跳 4 倍
+//      → 画面斜向拉丝 = 花屏。
+//   2) resizemode 必须给 RESIZEMODE_LINEAR(1)。
+//      ProcessImage（Filter.cpp:537-550）一旦发现共享内存宽高 ≠ 应用协商的
+//      输出宽高，且 resizemode==DISABLED(0)，就【直接丢弃图像】改画彩色错误条纹
+//      ("please set these to match")。驱动默认输出是 _media[0]=1920x1080，
+//      手机固定推 960x720 → 永远不匹配 → 表现为"花屏、没有视频"。
+//      给 1 之后 filter 自己线性缩放到应用要的分辨率，我们无需知道目标尺寸。
+//   3) timeout 不能写 0。Filter.cpp:535 把它换算成"允许连续错过多少帧"：
+//      missMax = (timeout + 200 - 1) / 200，timeout=0 → missMax=0，
+//      只要有一帧没在 200ms 内应答就立刻显示"Unity has stopped"条纹。
+//      写 1000ms（驱动自己的默认值 5 帧）才正常。
 //
 // 设计要点（和 v3 麦克风引擎同款思路）：
 //   1. 引擎线程随服务器启动，常开；驱动没装好时静默重试，不影响其他功能。
@@ -191,6 +210,22 @@ mod windows_impl {
         true
     }
 
+    /// 写共享内存头部的 8 个字段。stride 单位=像素（见文件头 ★★ 说明 1），
+    /// resizemode=LINEAR（说明 2），timeout=1000ms（说明 3）。
+    unsafe fn write_header(s: &Sender, w: i32, h: i32) {
+        let hdr = s.view;
+        std::ptr::write_unaligned(hdr as *mut i32, MAX_SHARED_IMAGE_SIZE as i32);
+        std::ptr::write_unaligned(hdr.add(4) as *mut i32, w);
+        std::ptr::write_unaligned(hdr.add(8) as *mut i32, h);
+        // stride：每行有多少个【像素】。我们的数据是紧凑排列的，所以 == w。
+        // （原版是 D3D11 纹理，RowPitch 可能带尾部填充，才需要除以 bpp。）
+        std::ptr::write_unaligned(hdr.add(12) as *mut i32, w);
+        std::ptr::write_unaligned(hdr.add(16) as *mut i32, 0); // format = FORMAT_UINT8（RGBA8）
+        std::ptr::write_unaligned(hdr.add(20) as *mut i32, 1); // resizemode = RESIZEMODE_LINEAR
+        std::ptr::write_unaligned(hdr.add(24) as *mut i32, 0); // mirrormode = DISABLED
+        std::ptr::write_unaligned(hdr.add(28) as *mut i32, 1000); // timeout(ms)
+    }
+
     /// 在互斥锁保护下写入共享内存头 + RGBA 像素（对应 shared.inl 的 Send 前半段）
     unsafe fn write_header_and_data(
         s: &Sender,
@@ -202,15 +237,7 @@ mod windows_impl {
         if w <= 0 || h <= 0 || data_size > MAX_SHARED_IMAGE_SIZE || rgba.len() < data_size {
             return false;
         }
-        let hdr = s.view; // 头部是 8 个 4 字节整数
-        std::ptr::write_unaligned(hdr as *mut i32, MAX_SHARED_IMAGE_SIZE as i32);
-        std::ptr::write_unaligned(hdr.add(4) as *mut i32, w);
-        std::ptr::write_unaligned(hdr.add(8) as *mut i32, h);
-        std::ptr::write_unaligned(hdr.add(12) as *mut i32, w * 4); // stride = 每行字节数（RGBA = 宽×4）
-        std::ptr::write_unaligned(hdr.add(16) as *mut i32, 0); // format = FORMAT_UINT8（RGBA8）
-        std::ptr::write_unaligned(hdr.add(20) as *mut i32, 0); // resizemode
-        std::ptr::write_unaligned(hdr.add(24) as *mut i32, 0); // mirrormode
-        std::ptr::write_unaligned(hdr.add(28) as *mut i32, 0); // timeout
+        write_header(s, w, h);
         // ── 行序翻转（v3.4.1 修复 Unity 通道上下颠倒）──
         // UnityCapture 的共享内存沿用 Unity 纹理约定 = **从下往上**（OpenGL 行序），
         // filter 会把第 0 行原样拷进 bottom-up DIB 的最后一行。
@@ -219,7 +246,7 @@ mod windows_impl {
         // 解决：逐行倒序拷贝（OBS 通道是 top-down 约定，那边不动）。
         {
             let row = (w as usize) * 4;
-            let dst_base = hdr.add(32);
+            let dst_base = s.view.add(32);
             for y in 0..h as usize {
                 std::ptr::copy_nonoverlapping(
                     rgba.as_ptr().add((h as usize - 1 - y) * row),
@@ -231,39 +258,41 @@ mod windows_impl {
         true
     }
 
-    /// 锁互斥体 → 写帧 → 解锁 → SetEvent(Sent)（完整对应 shared.inl 的 Send()）
+    /// 锁互斥体 → 写帧 → 解锁 → SetEvent(Sent)（对应 shared.inl 的 Send()）
+    ///
+    /// ★ 这里【不再】碰 Want 事件。Want 只在引擎循环里消费一次（见 engine 步骤 2），
+    /// 否则两个消费点会互相偷信号，活跃判定就变成竞态。
     unsafe fn send_frame(s: &Sender, w: i32, h: i32, rgba: &[u8]) -> bool {
         WaitForSingleObject(s.h_mutex, INFINITE);
         let ok = write_header_and_data(s, w, h, rgba);
         let _ = ReleaseMutex(s.h_mutex);
         if ok {
             let _ = SetEvent(s.h_sent);
-            // 顺手消耗 Want 事件（shared.inl 同款：没消耗说明 filter 还想要更多帧）
-            WaitForSingleObject(s.h_want, 0);
         }
         ok
     }
 
-    /// 拿一次互斥锁把 maxSize/width 清零标记"无信号"，并挂一张黑底占位图，
+    /// 挂一张黑底占位图（头部字段走 write_header，与真实帧完全一致），
     /// 让摄像头应用打开后不会看到随机内存垃圾。
     unsafe fn write_placeholder(s: &Sender) {
         const PW: i32 = 640;
         const PH: i32 = 480;
-        // 纯黑 RGBA 全 0 即可（数据缓冲全零已由首次映射提供，这里只写头部）
         WaitForSingleObject(s.h_mutex, INFINITE);
-        let hdr = s.view;
-        std::ptr::write_unaligned(hdr as *mut i32, MAX_SHARED_IMAGE_SIZE as i32);
-        std::ptr::write_unaligned(hdr.add(4) as *mut i32, PW);
-        std::ptr::write_unaligned(hdr.add(8) as *mut i32, PH);
-        std::ptr::write_unaligned(hdr.add(12) as *mut i32, PW * 4); // stride = 每行字节数
-        std::ptr::write_unaligned(hdr.add(16) as *mut i32, 0);
-        std::ptr::write_unaligned(hdr.add(20) as *mut i32, 0);
-        std::ptr::write_unaligned(hdr.add(24) as *mut i32, 0);
-        std::ptr::write_unaligned(hdr.add(28) as *mut i32, 0);
-        // 数据区清零（640*480*4 ≈ 1.2MB，只在打开时做一次）
-        std::ptr::write_bytes(hdr.add(32), 0, (PW as usize) * (PH as usize) * 4);
+        write_header(s, PW, PH);
+        // 数据区清零（640*480*4 ≈ 1.2MB，只在挂上时做一次）
+        std::ptr::write_bytes(s.view.add(32), 0, (PW as usize) * (PH as usize) * 4);
         let _ = ReleaseMutex(s.h_mutex);
         let _ = SetEvent(s.h_sent);
+    }
+
+    /// 纯黑一帧（与 OBS 通道同款隐私处理：手机停推后覆盖旧画面）
+    fn black_rgba(w: i32, h: i32) -> Vec<u8> {
+        let mut v = vec![0u8; (w as usize) * (h as usize) * 4];
+        // RGB=0 是黑；A 填 255，避免 32 位 ARGB 应用把整帧当透明
+        for px in v.chunks_exact_mut(4) {
+            px[3] = 255;
+        }
+        v
     }
 
     /// JPEG 字节 → RGBA8 缓冲，返回 (像素数据, 宽, 高)
@@ -317,6 +346,15 @@ mod windows_impl {
         let mut last_want = Instant::now() - Duration::from_secs(10);
         let mut active = false;
         let mut frames_sent: u64 = 0;
+        // ── 隐私/防花屏：手机停推超 1.5 秒就覆盖黑帧 ──
+        // 不做这件事的话，filter 会把最后一帧一直显示下去（"视频通话显示过期照片"），
+        // 而且 timeout 到期后还会切成彩色错误条纹。
+        let mut last_frame_at: Option<Instant> = None;
+        let mut last_dims = (0i32, 0i32);
+        let mut blanked = true;
+        // 诊断用：每 2 秒清零一次的索帧计数 + 上次打印统计的时刻
+        let mut wants: u64 = 0;
+        let mut stats_at = Instant::now();
 
         loop {
             // —— 1. 确保共享对象已挂上（驱动没装/没跑时每 500ms 增量重试）——
@@ -339,35 +377,61 @@ mod windows_impl {
                 continue;
             }
 
-            // —— 2. 取最新帧并解码上传 ——
+            // —— 2. 探测 filter 的索帧请求 ——
+            // ★ 这里是整个循环【唯一】消费 Want 的地方（v3.4.11 修正）。
+            // 以前 send_frame 里也消费一次、活跃检测又消费一次，两个消费点互相
+            // 抢信号 → "有没有应用在观看"变成拼运气的竞态判定。
+            let wanted = unsafe { WaitForSingleObject(s.h_want, 0) == WAIT_OBJECT_0 };
+            if wanted {
+                last_want = Instant::now();
+                wants += 1;
+            }
+
+            // —— 3. 取最新帧并解码上传 ——
             let frame = mailbox.lock().unwrap().take();
-            if let Some(jpeg) = frame {
-                match decode_jpeg_to_rgba(&jpeg) {
+            match frame {
+                Some(jpeg) => match decode_jpeg_to_rgba(&jpeg) {
                     Ok((rgba, w, h)) => {
                         if unsafe { send_frame(s, w, h, &rgba) } {
                             frames_sent += 1;
+                            last_dims = (w, h);
+                            last_frame_at = Some(Instant::now());
+                            blanked = false;
                             if frames_sent == 1 {
-                                info!("[Vcam] First frame uploaded to driver: {w}x{h}");
+                                info!("[Vcam] First frame uploaded to driver: {w}x{h} (stride={w}px, resizemode=LINEAR)");
                             }
                         }
                     }
                     Err(e) => warn!("[Vcam] JPEG decode failed: {e}"),
-                }
-            } else {
-                // 没有新帧：仍要回应 filter 的索要请求（重发上一帧会造成画面冻结，
-                // 这里只消耗 Want 保持握手活着，filter 超时返回旧帧即可）
-                unsafe {
-                    if WaitForSingleObject(s.h_want, 0) == WAIT_OBJECT_0 {
-                        let _ = SetEvent(s.h_sent); // 告知"没有新帧"，filter 继续用旧帧
+                },
+                None => {
+                    // 没有新帧，但应用确实在等 → 立刻应答 Sent，让它继续用共享内存
+                    // 里的上一帧。不应答的话 filter 要白等 200ms 才拿到 OLDFRAME，
+                    // 连续几次就撞上"Unity has stopped"彩色条纹。
+                    if wanted {
+                        unsafe {
+                            let _ = SetEvent(s.h_sent);
+                        }
                     }
                 }
             }
 
-            // —— 3. Want 新鲜度 → 活跃状态上报（cam_state 的源头）——
-            // 注意：上面 take() 到帧说明手机在推流；filter 索要帧说明有应用在观看。
-            if unsafe { WaitForSingleObject(s.h_want, 0) } == WAIT_OBJECT_0 {
-                last_want = Instant::now();
+            // —— 4. 手机停推 >1.5s → 覆盖黑帧（隐私：不把最后一帧一直挂着）——
+            if !blanked {
+                if let Some(t) = last_frame_at {
+                    if t.elapsed() >= Duration::from_millis(1500) {
+                        let (w, h) = last_dims;
+                        if w > 0 && h > 0 {
+                            let black = black_rgba(w, h);
+                            unsafe { send_frame(s, w, h, &black) };
+                            blanked = true;
+                            info!("[Vcam] 手机已停止推流 → 写入黑帧覆盖旧画面（应用不再显示过期照片）");
+                        }
+                    }
+                }
             }
+
+            // —— 5. Want 新鲜度 → 活跃状态上报（cam_state 的源头）——
             let now_active = last_want.elapsed() < Duration::from_millis(1000);
             if now_active != active {
                 active = now_active;
@@ -376,6 +440,16 @@ mod windows_impl {
                     if active { "is being watched by an app" } else { "released" }
                 );
                 tx.send(active).ok();
+            }
+
+            // —— 6. 每 2 秒打印一次吞吐，排查"有画面吗/谁在拉流"用 ——
+            if active && stats_at.elapsed() >= Duration::from_secs(2) {
+                stats_at = Instant::now();
+                let (w, h) = last_dims;
+                info!(
+                    "[Vcam] 2s 统计：filter 索帧 {wants} 次 / 已上传 {frames_sent} 帧 / 共享内存 {w}x{h}"
+                );
+                wants = 0;
             }
 
             std::thread::sleep(Duration::from_millis(8)); // 上限 ~125 次循环/秒，够 60fps

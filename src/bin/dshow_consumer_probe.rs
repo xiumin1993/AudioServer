@@ -31,7 +31,7 @@ use windows::Win32::System::Com::{
 const CLSID_SYSTEM_DEVICE_ENUM: GUID = GUID::from_u128(0x62be5d10_60eb_11d0_bd3b_00a0c911ce86);
 // CLSID_VideoInputDeviceCategory = {860BB310-5D01-11d0-BD3B-00A0C911CE86}
 const VIDEO_INPUT_CATEGORY: GUID = GUID::from_u128(0x860bb310_5d01_11d0_bd3b_00a0c911ce86);
-// CLSID_FilterGraph = {E5F188C1-B7BA-11cf-BA53-0020AF0BA770}
+// CLSID_FilterGraph = {E5F188C1-B7BA-11CF-BA53-0020AF0BA770}  (quartz.dll)
 const CLSID_FILTER_GRAPH: GUID = GUID::from_u128(0xe5f188c1_b7ba_11cf_ba53_0020af0ba770);
 
 fn main() {

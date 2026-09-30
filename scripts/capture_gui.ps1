@@ -2,7 +2,10 @@
 # Touches only our own process's window. ASCII only (PS 5.1 parses .ps1 as ANSI).
 param(
     [string]$Name = 'audioserver',
-    [string]$Out = 'D:\code\AudioServer\design\shots\gui.png'
+    [string]$Out = 'D:\temp\pcs_diag\gui.png',
+    # Capture the maximised window: the settings page is taller than the default
+    # 420x540 client area, so this is how you see every card at once.
+    [switch]$Maximize
 )
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -18,8 +21,9 @@ public static class Win {
 "@
 $p = Get-Process -Name $Name -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
 if ($null -eq $p) { Write-Output 'NO WINDOW'; exit 1 }
-[void][Win]::ShowWindowAsync($p.MainWindowHandle, 9)   # 9 = SW_RESTORE
-Start-Sleep -Milliseconds 400
+$sw = if ($Maximize) { 3 } else { 9 }   # 3 = SW_MAXIMIZE, 9 = SW_RESTORE
+[void][Win]::ShowWindowAsync($p.MainWindowHandle, $sw)
+Start-Sleep -Milliseconds 900
 [void][Win]::SetForegroundWindow($p.MainWindowHandle)
 Start-Sleep -Milliseconds 700
 $rect = New-Object Win+RECT

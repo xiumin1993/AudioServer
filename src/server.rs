@@ -893,15 +893,37 @@ async fn handle_connection(
         }
     }
 
-    // Downlink send task: loopback audio → WebSocket
+    // Downlink send task: loopback audio → WebSocket + periodic ping for keepalive
     // 客户端被移出广播表时 audio_rx 自然关闭，任务退出（Mic 模式即走此路径停止下行）
     let sink_send = ws_sink.clone();
     let key_send = client_key.clone();
     let send_task = tokio::spawn(async move {
-        while let Some(data) = audio_rx.recv().await {
-            let mut sink = sink_send.lock().await;
-            if sink.send(Message::Binary(data)).await.is_err() {
-                break;
+        // v3.4.5：WiFi 稳定性 —— 每 5 秒发一次 Ping，检测连接是否存活
+        let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        ping_interval.tick().await; // 跳过第一次立即触发的 tick
+
+        loop {
+            tokio::select! {
+                // 音频数据下行
+                data = audio_rx.recv() => {
+                    match data {
+                        Some(data) => {
+                            let mut sink = sink_send.lock().await;
+                            if sink.send(Message::Binary(data)).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break, // channel closed
+                    }
+                }
+                // 定时 Ping 心跳（WiFi 连接健康检测）
+                _ = ping_interval.tick() => {
+                    let mut sink = sink_send.lock().await;
+                    if sink.send(Message::Ping(vec![])).await.is_err() {
+                        info!("[{}] Ping failed - connection dead", key_send);
+                        break;
+                    }
+                }
             }
         }
         info!("[{}] Downlink task exited", key_send);
@@ -1156,6 +1178,14 @@ async fn handle_connection(
                 Ok(Message::Close(_)) => {
                     info!("Client requested close");
                     break;
+                }
+                Ok(Message::Pong(_)) => {
+                    // v3.4.5：收到 Pong —— WiFi 连接存活证明（日志级别，避免刷屏）
+                    info!("[{}] Pong received - connection alive", key_recv);
+                }
+                Ok(Message::Ping(_)) => {
+                    // tungstenite 自动回复 Pong，这里只记日志
+                    info!("[{}] Ping received", key_recv);
                 }
                 Err(e) => {
                     warn!("Receive error: {}", e);

@@ -56,6 +56,41 @@ cargo build --release
 
 调试用探针（可选，`cargo run --bin xxx`）：`vcam_probe`（枚举 DirectShow 摄像头）、`mic_probe`（枚举 WASAPI 设备）、`session_probe`、`cap_probe`。
 
+> 改文案要留意：`locales/*.toml` 是编译期嵌进二进制的，`build.rs` 已把这些文件登记为
+> 构建输入。没有 build.rs 的话，只改 .toml 不碰 .rs 时 cargo 会复用缓存的 lib，
+> 界面上直接显示成 `settings.xxx` 这种原始 key（2026-10-01 安装版截图里真翻过一次车）。
+
+### 3.1 打成安装程序（推荐分发方式，v3.8）
+
+绿色 zip 之外，还有一条"给普通用户"的产物：一个真正的 Windows 安装程序。
+
+```powershell
+# 一次性准备：装 Inno Setup（本仓库的脚本不会自动装，缺了只会提示命令）
+winget install -e --id JRSoftware.InnoSetup
+
+# 打包：release 构建 → 暂存 → 生成 config.default.json → ISCC 编译 → SHA-256
+powershell -NoProfile -ExecutionPolicy Bypass -File D:\code\AudioServer\pack_installer.ps1
+# 产物：dist\AudioServer-<版本>-win-x64-setup.exe（约 4.6MB）
+```
+
+安装程序做的事（`installer/setup.iss`，脚本头部注释里有完整取舍说明）：
+
+| 内容 | 说明 |
+|------|------|
+| 程序文件 | `audioserver.exe` + `server.exe` + README + quick-start + VERSION.txt + `config.default.json` |
+| 安装位置 | 默认 `{autopf}\PCAssistant`。普通用户选"仅当前用户"即可，**全程不弹 UAC**；要装 Program Files 由用户自己在向导里选（或命令行 `/ALLUSERS`） |
+| 快捷方式 | 开始菜单：启动 / 配置文件 / 快速上手 / 卸载；桌面图标是可选项，默认不勾 |
+| 卸载项 | 控制面板"程序和功能"正常登记（固定 AppId GUID，二次运行是升级而不是装两份） |
+| 配置文件 | 安装后在 `%APPDATA%\PCAssistant\config.json` 放一份默认配置；**已存在就绝不覆盖** |
+| 卸载保留 | `%APPDATA%\PCAssistant`（配置是用户资产、日志是排障证据）。要彻底重置就自己删这个目录 |
+
+**安装程序不装任何驱动，也不附带驱动安装脚本。** VB-CABLE / Unity Capture / OBS Virtual
+Camera 全部由用户自己去官网装：`pack_installer.ps1` 有一道硬门禁，暂存目录里只要出现
+`.msi/.inf/.sys/.dll/.bat/.ps1/.reg` 或任何计划外文件，打包直接失败。程序启动时只做
+只读检测 + 文字提示（见第 4 节"启动自检门禁"）。
+
+只想打绿色 zip（不装 Inno 也能用）：`pack_release.ps1`，产物 `dist\AudioServer-<版本>-win-x64.zip`。
+
 ## 4. 运行
 
 双击 `audioserver.exe`（弹出 egui 窗口）或命令行：
@@ -69,9 +104,12 @@ audioserver.exe --port 8080 --sample-rate 48000 --channels 2 --buffer-size 1024
 
 **日志与窗口（v3.7）**：`audioserver.exe` 编译为 Windows 的 GUI 子系统程序，**启动后只有一个
 egui 窗口，不会再附带那个刷日志的黑色控制台**（以前双击 exe 会同时弹出控制台，正式包里也一样）。
-日志一条不少，有三个地方能看：① 窗口里的**日志**页；② exe 同目录的 `audioserver.log`
-（追加写，完整 INFO 级别）；③ 想要实时滚动的控制台，启动前设环境变量
-`PCSPEAKER_CONSOLE=1`（自己开一个控制台）或 `PCSPEAKER_CONSOLE=attach`（从 cmd/PowerShell
+日志一条不少，有三个地方能看：① 窗口里的**日志**页；② `audioserver.log`（追加写，完整
+INFO 级别）——**写在 exe 同目录**（绿色版和开发时就是这个位置），但如果程序装在
+Program Files 这种普通用户写不进的地方，会自动退到 `%APPDATA%\PCAssistant\audioserver.log`，
+实际路径每次启动都会打在日志第一屏、设置页"配置文件"卡片里也写着；③ 想要实时滚动的控制台，
+用配置项 `diagnostics.show_console`（见 4.1）或启动前设环境变量
+`PCSPEAKER_CONSOLE=1`（自己开一个控制台）/ `PCSPEAKER_CONSOLE=attach`（从 cmd/PowerShell
 里启动时接回当前终端）。命令行版 `server.exe` 本来就是控制台程序，日志照常打在终端上。
 后台线程万一 panic 也会被写进 `audioserver.log`（`[Panic] ...`），不会出现"程序悄悄少了一条线"。
 
@@ -91,6 +129,63 @@ GUI 顶部三个模式胶囊：**Speaker Mode**（电脑→手机声音）/ **Mi
 # 需管理员，自行执行
 New-NetFirewallRule -DisplayName "AudioServer" -Direction Inbound -LocalPort 8080 -Protocol TCP -Action Allow
 ```
+
+### 4.1 配置文件 config.json（v3.8）
+
+位置：**`%APPDATA%\PCAssistant\config.json`**（Windows）/ `~/.config/PCAssistant/config.json`
+（macOS、Linux）。首次启动自动生成，安装程序也会预先放一份。改完**重启程序**生效
+（音频/硬件参数在启动时读一次，运行中不改）。
+
+三条铁律（`src/config.rs` 的实现原则）：
+
+1. **每个键都有默认值** —— 删掉文件 = 恢复出厂；文件里少写几个键也完全合法
+   （结构体级 `#[serde(default)]`），多余的未知键一律忽略（老程序读新配置不会崩）。
+2. **文件读坏了绝不覆盖** —— JSON 语法错误时按默认值启动，日志里写清
+   `[Config] invalid config file, fell back to defaults: <原因>`，原文件保持不动。
+3. **越界值自动夹紧并留痕** —— 例如 `camera.fps: 300` 会夹成 60，日志与界面日志页出现
+   `[Config] camera.fps=300 too large, clamped to 60`。摄像头宽高还会强制取偶
+   （NV12/YUV 色度 2×2 子采样，奇数边长会让最后一行列错位）。
+
+#### 全部配置项与默认值
+
+| 键 | 默认 | 作用 |
+|----|------|------|
+| `language` | `auto` | 界面语言：`auto` / `en` / `zh`（见第 9 节） |
+| `network.port` | `8080` | WebSocket 监听端口 |
+| `network.bind` | `"0.0.0.0"` | 监听地址；`127.0.0.1` = 只允许 USB adb reverse 本机连 |
+| `network.ping_interval_ms` | `5000` | 服务器→手机心跳间隔 |
+| `speaker.sample_rate` | `48000` | 下行采样率（最终仍以声卡 mix format 为准，见下） |
+| `speaker.channels` | `2` | 下行声道数（只认 1/2） |
+| `speaker.buffer_frames` | `1024` | 期望缓冲帧数（共享模式下 Windows 会按 mix format 覆盖，主要影响我们排空节奏） |
+| `speaker.capture_device_hint` | `""` | **从哪台播放设备取环回**：按设备友好名不区分大小写子串匹配，如 `"Realtek"`；留空 = 系统默认播放设备；写了没匹配上只 warn 并退回默认设备 |
+| `speaker.pause_while_mic_live` | `false` | 手机当麦克风时是否暂停电脑→手机下行（防自激） |
+| `mic.inject_device_hint` | `"CABLE Input"` | 上行注入的虚拟声卡播放端名字 |
+| `mic.monitor_capture_hint` | `"CABLE Output"` | 检测"谁在用麦克风"时扫描的捕获端名字 |
+| `mic.uplink_sample_rate` | `48000` | 手机上行 PCM 的采样率（与手机端设置一致才对） |
+| `mic.max_queue_ms` | `250` | 上行抖动队列上限，超了丢最旧的，避免越播越延迟 |
+| `camera.width` / `height` | `960` / `720` | OBS 虚拟摄像头映射分辨率（手机画面会缩放过来） |
+| `camera.fps` | `30` | OBS 虚拟摄像头帧率 |
+| `camera.placeholder_width` / `height` | `640` / `480` | Unity 通道"待命/无信号"占位帧尺寸 |
+| `camera.blackout_after_ms` | `1500` | 手机停推多久后用黑帧盖掉旧画面（隐私：不留最后一帧） |
+| `camera.unity_enabled` | `true` | 关掉就不创建 Unity Capture 共享内存通道 |
+| `camera.obs_enabled` | `true` | 关掉就不创建 OBS Virtual Camera 映射 |
+| `diagnostics.log_level` | `"info"` | `trace`/`debug`/`info`/`warn`/`error`；`RUST_LOG` 优先级更高 |
+| `diagnostics.show_console` | `false` | 启动时是否附带控制台窗口 |
+| `diagnostics.stat_interval_ms` | `1000` | 码率/帧率统计窗口 |
+| `diagnostics.skip_env_check` | `false` | 跳过启动驱动门禁（等价 CLI `--skip-env-check`） |
+
+Unity 通道**故意不用** `camera.width/height`：它的共享内存头必须跟手机真实推上来的分辨率
+一致，历史上写死分辨率导致过花屏，所以那条通道只吃 `placeholder_*` 与 `blackout_after_ms`。
+
+#### 怎么改
+
+- **图形界面**：设置页里的端口/采样率/声道/缓冲区/暂停下行，改完失焦或按回车就写回
+  `config.json`（服务运行中这些输入框是灰的，先停服务）。
+- **直接编辑文件**：硬件类项目（设备名、虚拟摄像头分辨率、通道开关）目前只能这样改。
+- **命令行版**：`server.exe --port ... --sample-rate ...` 等参数仍然有效，是临时覆盖。
+- **要一份权威默认值**：`server.exe --print-default-config` 打印当前二进制内嵌的默认配置
+  （打包脚本就是用它生成安装器里那份 `config.default.json`，所以文档/安装包/程序三者
+  的默认值永远同源）。
 
 ## 5. 连接方式
 
@@ -122,16 +217,28 @@ adb reverse tcp:8080 tcp:8080
 | 手机息屏后掉线 | 手机端开启"麦克风守护/摄像头守护"（前台服务常驻通知保活）；另外关闭系统对 App 的电池优化 |
 | 双击 exe 只有一个窗口，看不到日志在滚 | 正常：v3.7 起 GUI 版不再附带控制台黑窗口（§4「日志与窗口」）。看界面**日志**页或 `audioserver.log`；要控制台就 `PCSPEAKER_CONSOLE=1` 再启动，或直接用命令行版 `server.exe` |
 | 任务管理器里 audioserver 占十几个 CPU 点 | v3.7 前的 bug（WASAPI 回环取到空缓冲区时满核自旋），已修：空闲约 0.4%、满速推流约 0.4%（8 逻辑核口径） |
+| 改了 `config.json` 但没生效 | 配置只在**启动时**读一次：保存后先完全退出程序（不是关窗口）再重新打开。还有两种可能：① JSON 语法写错（多逗号/少引号）→ 整份文件被忽略、全部回默认值，日志里有 `[Config] invalid config file, fell back to defaults: …`；② 值超出允许区间 → 被夹回边界，日志里有 `[Config] camera.fps=300 too large, clamped to 60` 这样的告警 |
+| 界面语言改了没变 | 语言同样只在启动时应用，需重启。若重启后仍是旧语言：确认改的是 `%APPDATA%\PCAssistant\config.json`（不是安装目录里的 `config.default.json`，那份只是出厂模板） |
+| 指定了设备名却没走指定设备 | 名称匹配是"转大写后子串包含"，取**第一个**命中；没命中时只记一条 warn 然后退回系统默认设备，程序不会报错退出。去日志看 `Using audio device: … (…)` 括号里的来源（`config 指定` / `系统默认播放设备` / `系统默认播放设备（hint 未命中）`），再照系统声音设置里的设备全称重写 `speaker.capture_device_hint` / `mic.inject_device_hint` |
+| 卸载后想彻底清干净 | 有意设计：卸载只删程序文件，**保留** `%APPDATA%\PCAssistant`（配置和日志属于你的数据）。要清就手动删这个目录 |
 
 ## 7. 项目结构
 
 ```
-src/main.rs      egui GUI + 模式切换
+src/main.rs      egui GUI + 模式切换 + 双路日志（stderr / audioserver.log）
+src/config.rs    config.json：默认值、夹紧校验、原子读写（%APPDATA%\PCAssistant）
 src/server.rs    WebSocket 服务、协议分发、WASAPI 环回采集、cpal 播放
 src/mic_out.rs   手机上行 PCM → VB-CABLE 注入（含 44.1k↔48k 线性重采样）
 src/vcam.rs      Unity Capture 共享内存发送端（协议移植自官方 shared.inl）
 src/vcam_obs.rs  OBS Virtual Camera 共享内存队列发送端（NV12 三槽环）
-src/bin/         设备枚举探针（调试用）
+src/env_check.rs 启动门禁：只读检测驱动是否就位（不装、不写）
+src/lang.rs      rust-i18n 封装：语言优先级、系统语言探测（带缓存）
+src/bin/         命令行版 server + 设备枚举探针（调试用）
+locales/         en.toml / zh.toml（编译期嵌入，build.rs 负责让改动生效）
+installer/       setup.iss（Inno Setup 安装脚本）
+build.rs         把 locales/*.toml 登记为构建输入
+pack_release.ps1    打绿色 zip
+pack_installer.ps1  打安装程序（含"禁止出现驱动文件"硬门禁）
 third_party/     UnityCapture 官方源码（MIT，仅本地参考，已 .gitignore 不入库）
 ```
 
@@ -207,11 +314,14 @@ macOS 禁止 DirectShow 式虚拟摄像头；正路是写一个 **CoreMediaIO Ca
 | 方式 | 怎么做 | 用途 |
 |------|--------|------|
 | 环境变量 | `set PCSPEAKER_LANG=zh`（或 `en`）后再启动 | 排错/截图验证，临时覆盖不留痕 |
-| 设置文件 | exe 同目录 `settings.txt` 写 `language=auto\|en\|zh` | 用户手动指定；GUI 里 LANGUAGE 卡片选档会自动写这里 |
+| 配置文件 | `%APPDATA%\PCAssistant\config.json` 的 `language`：`auto`\|`en`\|`zh` | 用户长期设置；GUI 里 LANGUAGE 卡片选档会自动写这里 |
 | 系统语言 | 不用管 | 默认（`auto`） |
 
-> `settings.txt` 与 `audioserver.log` 一样放在 exe 同目录：**不写注册表、不碰 AppData**，
-> 删掉文件即恢复默认（绿色单文件的承诺不变）。
+> v3.7 之前语言存在 exe 同目录的 `settings.txt`。v3.8 起统一进 `config.json`：
+> 首次启动时如果 `config.json` 是刚创建的、且同目录还有旧 `settings.txt`，会把那一条
+> 语言设置搬过去（只搬一次，之后 `settings.txt` 不再读）。
+> 装进 Program Files 的用户本来就没法在 exe 旁边写文件，配置放 AppData 也是这个原因；
+> 删掉 `config.json` 即恢复默认，绿色单 exe 的承诺不变。
 
 其他约定：
 

@@ -27,6 +27,8 @@
 
 > **隐私模型**：手机相机/麦克风硬件默认**彻底关闭**。服务器通过驱动握手事件（Want）与系统注册表实时检测"有没有应用真的在用"，只在使用的瞬间通知手机开硬件，用完 1 秒内自动关。手机上有红色 REC 横幅=硬件真实开启，任何时刻可一键强停。
 
+> 表里第 3、4、5 项**不用自己核对**：程序启动时会只读检测这三项，缺必需驱动就不进主界面、不起服务端，并在向导页给出下载入口（见 §4）。
+
 ## 2. 安装驱动
 
 ### 2.1 VB-CABLE（麦克风模式）
@@ -59,6 +61,17 @@ cargo build --release
 ```bash
 audioserver.exe --port 8080 --sample-rate 48000 --channels 2 --buffer-size 1024
 ```
+
+> 注：上面这组参数只有命令行版 `server.exe` 认（`server.exe --port 8080 ...`）；
+> GUI 版的端口/采样率在窗口 Settings 页里改，启动时不解析命令行参数。
+
+**启动自检门禁（v3.5）**：GUI 与 CLI 启动时都会先做一次**只读**检测——
+VB-CABLE（查声卡列表里的 `CABLE Input/Output`）+ Unity Capture / OBS Virtual Camera
+任一（查两个滤镜的 CLSID 是否注册）。必需项齐全才进主界面并起服务端；
+缺项时 GUI 整页显示"需要准备驱动"向导（可打开官网下载页，或一键运行随包 `drivers/UnityCapture/Install.bat`），
+**8080 根本不监听**；CLI 打印缺项后以退出码 2 结束。FrameServer 只作为提示，不参与放行。
+开发开关：`PCSPEAKER_SKIP_ENV_CHECK=1` 跳过门禁，`PCSPEAKER_FORCE_ENV_GUIDE=1` 强制停在向导页，
+CLI 用 `--skip-env-check`。
 
 GUI 顶部三个模式胶囊：**Speaker Mode**（电脑→手机声音）/ **Mic Mode**（手机→电脑麦克风）/ **Camera Mode**（手机→电脑摄像头）。每个模式页内有：连接客户端列表、实时统计（分辨率/fps/码率）、Request（主动唤起手机）与 Force Stop（一键强停）。
 

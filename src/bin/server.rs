@@ -24,6 +24,11 @@ struct Args {
     /// Buffer size (in samples)
     #[arg(short, long, default_value = "1024")]
     buffer_size: u32,
+
+    /// 跳过启动环境自检（缺驱动也硬起）。默认会先检查 VB-CABLE / 虚拟摄像头，
+    /// 缺必需驱动时直接打印缺项并退出，不监听端口 —— 与 GUI 版行为一致。
+    #[arg(long)]
+    skip_env_check: bool,
 }
 
 #[tokio::main]
@@ -33,6 +38,26 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+
+    // ── v3.5：启动环境门禁（只读检测，不写注册表、不装驱动）──
+    if !args.skip_env_check {
+        let report = audioserver::env_check::detect();
+        if !report.ready() {
+            eprintln!("=== Audio Server (CLI) 启动前自检未通过 ===");
+            for m in report.missing() {
+                eprintln!("  缺少：{m}");
+            }
+            eprintln!(
+                "\n  VB-CABLE 下载：https://vb-audio.com/Cable/\n  \
+                 OBS Studio 下载（自带 OBS Virtual Camera）：https://obsproject.com/download"
+            );
+            if let Some(p) = &report.driver_installer_path {
+                eprintln!("  或运行随包的 Unity Capture 注册脚本：{p}");
+            }
+            eprintln!("\n（确认知道自己在做什么时，可加 --skip-env-check 强行启动）");
+            std::process::exit(2);
+        }
+    }
 
     let config = ServerConfig {
         port: args.port,

@@ -8,6 +8,7 @@ use std::sync::OnceLock;
 use std::time::Instant;
 use tokio::sync::mpsc as tokio_mpsc;
 
+use audioserver::env_check::{self, EnvGuide, GuideAction};
 use audioserver::server::{run_server, ServerCommand, ServerConfig, ServerEvent, ServerStatus};
 
 // ── 双输出日志（stderr + 文件）──
@@ -130,6 +131,9 @@ fn main() -> eframe::Result<()> {
         "Audio Server",
         options,
         Box::new(|cc| {
+            // 中文字体兜底（必须在设 visuals / 建界面之前）
+            install_cjk_fonts(&cc.egui_ctx);
+
             // 基于 egui 浅色主题，只覆盖需要的颜色
             let mut visuals = egui::Visuals::light();
             visuals.override_text_color = Some(colors::TEXT_PRIMARY);
@@ -154,9 +158,85 @@ fn main() -> eframe::Result<()> {
             visuals.selection.stroke = egui::Stroke::new(1.0_f32, colors::ACCENT);
             cc.egui_ctx.set_visuals(visuals);
 
-            Ok(Box::new(AudioServerApp::new()))
+            let app = AudioServerApp::new();
+            // 门禁生效时标题栏也换成"需要准备驱动"，任务栏上一眼可辨
+            if let Some(g) = app.env_gate.as_ref() {
+                cc.egui_ctx
+                    .send_viewport_cmd(egui::ViewportCommand::Title(
+                        g.viewport_title().to_string(),
+                    ));
+            }
+            Ok(Box::new(app))
         }),
     )
+}
+
+// ── 中文字体兜底（v3.5）──
+// 为什么必须做：egui 自带的两款字体（Proportional / Monospace）不含中日韩字形，
+//              中文会被画成一排方框 □□□（环境向导页全是中文，首屏就不能看）。
+// 为什么从系统字体目录读，而不是塞进 exe：
+//              ① 中文字体动辄 10MB，会毁掉"绿色单文件、体积小"的目标；
+//              ② 微软雅黑/黑体是微软版权字体，重新分发不合规。
+// 失败策略：一个都读不到 → 保持默认字体，界面退回英文显示，绝不 panic。
+//           （epaint 解析字体失败是直接 panic 的，所以交给它之前先校验文件头）
+const CJK_FONT_NAME: &str = "system-cjk";
+
+/// 候选中文字体，按"最稳的排前面"排序：
+/// 单文件 TTF 解析最保险，TTC（字体集合）放后面。
+const CJK_FONT_CANDIDATES: &[&str] = &[
+    r"C:\Windows\Fonts\simhei.ttf",                 // 黑体：中文版 Windows 标配，纯 TTF
+    r"C:\Windows\Fonts\Deng.ttf",                   // 等线
+    r"C:\Windows\Fonts\msyh.ttc",                   // 微软雅黑：Win10/11 各语言版本都有（TTC 集合）
+    r"C:\Windows\Fonts\simsun.ttc",                 // 宋体（TTC 集合）
+    "/System/Library/Fonts/PingFang.ttc",           // macOS（Mac 移植期中文界面同样需要）
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", // Linux 兜底
+];
+
+/// 只校验文件头魔数：够挡住"读回来的根本不是字体"这种最坏情况。
+/// TrueType 开头是版本号 0x00010000；'true'/'ttcf'/'OTTO' 是另外几种合法开头。
+fn looks_like_font(b: &[u8]) -> bool {
+    if b.len() < 12 {
+        return false;
+    }
+    let h = &b[..4];
+    if h == [0x00, 0x01, 0x00, 0x00] || h == b"true" || h == b"OTTO" || h == b"ttcf" {
+        return true;
+    }
+    // 'ttcf' 之外还可能是 'oth '（OpenType 集合）；其它一律拒绝
+    h == b"oth "
+}
+
+/// 把系统中文字体追加到两个字体族末尾，作为"内置字体画不出来的字"的兜底字形。
+/// 注意是 push 到末尾而不是插到开头：英文/数字继续用原来的 egui 字体，观感不变。
+fn install_cjk_fonts(ctx: &egui::Context) {
+    for path in CJK_FONT_CANDIDATES {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        if !looks_like_font(&bytes) {
+            log::warn!("[Main] {path} 不像字体文件，跳过");
+            continue;
+        }
+        let mut fonts = egui::FontDefinitions::default();
+        fonts
+            .font_data
+            .insert(CJK_FONT_NAME.to_owned(), egui::FontData::from_owned(bytes));
+        for family in [
+            egui::FontFamily::Proportional,
+            egui::FontFamily::Monospace,
+        ] {
+            fonts
+                .families
+                .entry(family)
+                .or_default()
+                .push(CJK_FONT_NAME.to_owned());
+        }
+        ctx.set_fonts(fonts);
+        log::info!("[Main] CJK font installed: {path}");
+        return;
+    }
+    log::warn!("[Main] 系统里没找到可用的中文字体，界面中文会显示成方框");
 }
 
 // ── Tab 枚举 ──
@@ -250,6 +330,9 @@ struct AudioServerApp {
     cam_caps: Option<String>,
     /// GUI 预览纹理（每秒随 CamFrame 事件刷新一张最新 JPEG 解码结果）
     cam_texture: Option<egui::TextureHandle>,
+    // ── v3.5 启动环境门禁 ──
+    /// Some = 必需驱动缺失，主窗口整页只显示向导，服务端线程不起
+    env_gate: Option<EnvGuide>,
 }
 
 impl AudioServerApp {
@@ -284,9 +367,35 @@ impl AudioServerApp {
             cam_stats: None,
             cam_caps: None,
             cam_texture: None,
+            env_gate: None,
         };
-        // 启动时自动开启服务，不用手动点 Toggle
-        app.start_server();
+        // v3.5：启动先做一次【只读】环境自检（不写注册表、不装任何东西）。
+        //   · 必需驱动齐 → 和以前一样，自动开启服务端
+        //   · 缺驱动     → 不起服务端线程，主窗口只显示"环境准备"向导页，
+        //                  用户装完点【重新检测】才会真正进入主界面
+        // 开发调试（Mac 移植期 / 想在缺驱动的机器上看 UI）可用环境变量跳过：
+        //   set PCSPEAKER_SKIP_ENV_CHECK=1
+        let report = env_check::detect();
+        let skip_gate = std::env::var("PCSPEAKER_SKIP_ENV_CHECK").is_ok();
+        // 开发/演示用：PCSPEAKER_FORCE_ENV_GUIDE=1 时，第一帧就停在向导页，
+        // 并且把检测结果换成"什么都没装"的样例，这样不用找一台干净电脑，
+        // 也能看到缺项 + 下载按钮的完整形态（点【重新检测】会按真实结果判定，
+        // 环境其实齐全的话照常进主界面）。
+        let force_guide = std::env::var("PCSPEAKER_FORCE_ENV_GUIDE").is_ok();
+        let report = if force_guide {
+            env_check::EnvReport::demo_missing()
+        } else {
+            report
+        };
+        if (report.ready() || skip_gate) && !force_guide {
+            if skip_gate && !report.ready() {
+                log::warn!("[Main] PCSPEAKER_SKIP_ENV_CHECK set —— 环境未齐，仍强行进入主界面");
+            }
+            app.start_server();
+        } else {
+            log::info!("[Main] 环境门禁生效：服务端未启动，等待用户安装驱动");
+            app.env_gate = Some(EnvGuide::new(report));
+        }
         app
     }
 
@@ -1875,6 +1984,44 @@ impl AudioServerApp {
 
 impl eframe::App for AudioServerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // ── v3.5 环境门禁：必需驱动没齐时，整页只显示向导 ──
+        // 这里【不 poll_server_events、不画主界面、不起服务端】——
+        // 用户看到的就是"程序还没开始工作"，避免连上手机才发现没设备。
+        if self.env_gate.is_some() {
+            // 门禁期间 1 秒兜底重绘：用户去装驱动/启动 FrameServer 时页面会自己刷新，
+            // 不会出现"点了没反应"的错觉。
+            ctx.request_repaint_after(std::time::Duration::from_millis(1000));
+            let mut action = GuideAction::None;
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::none()
+                        .fill(colors::BG_WHITE)
+                        .inner_margin(egui::Margin::symmetric(18.0, 16.0)),
+                )
+                .show(ctx, |ui| {
+                    if let Some(g) = self.env_gate.as_mut() {
+                        action = g.render(ui);
+                    }
+                });
+            match action {
+                GuideAction::Ready => {
+                    // 驱动装好了：撤掉门禁，此刻才真正启动服务端
+                    self.env_gate = None;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Title(
+                        "Audio Server".to_string(),
+                    ));
+                    self.start_server();
+                    ctx.request_repaint();
+                }
+                GuideAction::Quit => {
+                    // 窗口正在关闭：门禁状态【保留】，避免关窗前的最后一帧
+                    // 落到主界面上（那样会在退出瞬间把服务端 UI 闪出来）。
+                }
+                GuideAction::None => {}
+            }
+            return;
+        }
+
         self.poll_server_events(ctx);
         let is_running = self.server_status == ServerStatus::Running;
 

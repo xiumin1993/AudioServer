@@ -238,6 +238,25 @@ mod colors {
     pub const INPUT_BG_DISABLED: Color32 = Color32::from_rgb(243, 244, 246);
 }
 
+/// 下拉框的一项：`label` 给人看，`value` 是写进 config.json 的那串字。
+///
+/// 为什么 value 存字符串而不是直接存数字：设置页的落盘逻辑（persist_settings）
+/// 本来就按"界面上的字符串 → 解析 → 写进 Config 字段"这条路走，
+/// 下拉复用同一条路就够，不用为它单开一套写入通道。
+#[derive(Clone)]
+struct ComboOption {
+    label: String,
+    value: String,
+}
+
+/// 用一串数字值生成下拉选项，label = 值 + 后缀（如 "48000 Hz"）。
+fn number_options(values: &[&str], suffix: &str) -> Vec<ComboOption> {
+    values
+        .iter()
+        .map(|v| ComboOption { label: format!("{v}{suffix}"), value: v.to_string() })
+        .collect()
+}
+
 fn main() -> eframe::Result<()> {
     // 顺序不能乱：配置要第一个读，因为"要不要开控制台"和"日志级别"都由它决定，
     // 而这两个东西一旦开始输出日志就再也改不回来了。
@@ -770,16 +789,27 @@ impl AudioServerApp {
     /// 真正写文件的时机由 flush_settings_if_ready 统一判断。
     /// dirty 里那个 bool = "这一项已经改完了"（失去焦点或按了回车），
     /// 只要有一项改完，就把这一批一起落盘。
+    ///
+    /// `numeric = true`：这一格只该填数字（现在只有端口用到）。
     fn config_text_edit(
         ui: &mut egui::Ui,
         value: &mut String,
         key: &'static str,
         dirty: &mut Vec<(&'static str, bool)>,
+        numeric: bool,
     ) {
+        // 只允许数字：egui 0.29 没有 TextEdit::numeric()（那是 0.31 才加的），
+        // 所以走"事后清理"：这一帧文本真变了就把非数字字符剔掉。
+        // 效果上和事前拦截一样（字母根本留不下来），代价是粘贴一整串脏字符时
+        // 光标会跳到末尾 —— 端口一共五位数，可以接受。
         let edit = egui::TextEdit::singleline(value)
             .desired_width(88.0)
             // 内边距：数字贴着边框会显得"不像个框"，留 6x4 才像输入控件
             .margin(egui::Margin::symmetric(6.0, 4.0))
+            // 长度也顺手限住：端口最长 5 位（65535），第六位压根敲不进去，
+            // 比"让你敲满 8 位再告诉你解析失败"友好。
+            // 以后要是有更多位数/别的 numeric 字段，把这个上限提成参数。
+            .char_limit(if numeric { 5 } else { usize::MAX })
             .horizontal_align(egui::Align::RIGHT);
         // 为什么两种状态都要包一层 Ui::scope（看着很多余，其实是被坑出来的）：
         // TextEdit 的边框/底色不是一起画的 —— show() 先往 painter 里塞一个 Shape::Noop 占位，
@@ -788,6 +818,12 @@ impl AudioServerApp {
         // 结果【直接 add 的输入框永远不画框】，只剩一串数字贴在白卡片上（2026-10-01 实测：
         // 停止服务后 48000/2/1024 三行像素级纯白，一个框都没有；运行中走了 scope 反而有框）。
         // 包一层 scope 之后，占位下标落在子 ui 自己的列表里，父级怎么搬都不影响它。
+        //
+        // ⚠️ 取的是 `.inner` 不是 `.response`（2026-10-01 踩到）：
+        // `Ui::scope` 返回 InnerResponse，`.response` 是【那层子 ui 自己】的响应
+        // （egui 内部走 remember_min_rect，Sense 只有 hover），
+        // changed() / lost_focus() 永远是 false —— 表现就是"端口改了死活不落盘"，
+        // 而且界面上看着一切正常。真正的输入框响应是闭包的返回值，在 `.inner` 里。
         let resp = ui
             .scope(|ui| {
                 // 文本框底色只认 extreme_bg_color（不随交互状态变），所以禁用态在这里换一档：
@@ -799,7 +835,10 @@ impl AudioServerApp {
                 };
                 ui.add(edit)
             })
-            .response;
+            .inner;
+        if numeric && resp.changed() {
+            value.retain(|c| c.is_ascii_digit());
+        }
         // changed() 只在"这一帧里文本真的变了"时为真。
         // 为什么不用"整个界面还有没有焦点"来判断改完没有：按 Tab 时焦点会跳到
         // 下一个控件（还是 is_some），那样就永远不落盘了。所以问这个框自己。
@@ -813,7 +852,95 @@ impl AudioServerApp {
         }
     }
 
-    /// 攒着的改动什么时候写盘：有任意一项"改完了"（焦点离开该框 / 在该框里按了回车）。
+    /// v3.8.1：下拉框版的配置项 —— 采样率 / 声道数 / 缓冲区大小这类
+    /// "合法取值就那么几个"的量，一律做成选择而不是手打（用户 2026-10-01 提的）。
+    /// 手打的三个毛病：打错一位要靠夹紧才救得回来、用户不知道能填什么、
+    /// 填了个没测过的值等于拿稳定性赌。下拉把"能填什么"直接摊开，选中的天然合法。
+    ///
+    /// 当前值不在选项里怎么办（用户自己手改过 config.json）：不藏起来 ——
+    /// 选择框显示"自定义（当前值）"，并把这一项放在列表最上面，
+    /// 否则用户一打开下拉就被迫改掉了他手调的值。
+    fn config_dropdown(
+        ui: &mut egui::Ui,
+        value: &mut String,
+        key: &'static str,
+        options: &[ComboOption],
+        dirty: &mut Vec<(&'static str, bool)>,
+    ) {
+        let mut items: Vec<ComboOption> = options.to_vec();
+        let mut current = items.iter().position(|o| o.value == *value);
+        if current.is_none() {
+            items.insert(
+                0,
+                ComboOption {
+                    label: lang::tf("settings.custom_value", &[("value", value)]),
+                    value: value.clone(),
+                },
+            );
+            current = Some(0);
+        }
+        let current = current.unwrap_or(0);
+        let selected_label = items[current].label.clone();
+        let mut picked = current;
+
+        // 为什么要包一层 scope，两个原因（都是踩出来的）：
+        // ① ComboBox 和 TextEdit 一样用"先占位、后回填"的手法画背景，
+        //    放进 Grid 会被重排掉（见 config_text_edit 上面那段注释）；
+        // ② 下拉框的底色取自 widgets.*.weak_bg_fill，而那一项同时也是
+        //    弹出菜单每一行的底色 —— 在全局 visuals 里改会把整张菜单染成一片灰，
+        //    所以只在这一小格里改。子 ui 会克隆一份 style，改它不外溢。
+        ui.scope(|ui| {
+            let enabled = ui.is_enabled();
+            {
+                let v = ui.visuals_mut();
+                if enabled {
+                    v.widgets.inactive.weak_bg_fill = colors::INPUT_BG;
+                    v.widgets.inactive.bg_stroke =
+                        egui::Stroke::new(1.0_f32, colors::INPUT_BORDER);
+                    v.widgets.hovered.weak_bg_fill = colors::INPUT_BG_HOVER;
+                    v.widgets.hovered.bg_stroke =
+                        egui::Stroke::new(1.0_f32, colors::INPUT_BORDER_HOVER);
+                } else {
+                    // 禁用态走 noninteractive：灰底 + 浅边框，值照样读得出来
+                    v.widgets.noninteractive.weak_bg_fill = colors::INPUT_BG_DISABLED;
+                    v.widgets.noninteractive.bg_stroke =
+                        egui::Stroke::new(1.0_f32, colors::BORDER);
+                }
+                // 展开中 / 点下去的那一帧描一圈蓝，和文本框的聚焦态同一套语言
+                v.widgets.active.weak_bg_fill = colors::BG_WHITE;
+                v.widgets.active.bg_stroke = egui::Stroke::new(1.5_f32, colors::ACCENT);
+                v.widgets.open.weak_bg_fill = colors::ACCENT_BG;
+                v.widgets.open.bg_stroke = egui::Stroke::new(1.5_f32, colors::ACCENT);
+            }
+            egui::ComboBox::from_id_salt(key)
+                .selected_text(egui::RichText::new(selected_label).size(13.0))
+                // 按钮和弹出列表同宽：120px 装得下 "192000 Hz" 和 "自定义（1234）"
+                .width(120.0)
+                .show_ui(ui, |ui| {
+                    for (i, o) in items.iter().enumerate() {
+                        ui.selectable_value(
+                            &mut picked,
+                            i,
+                            egui::RichText::new(o.label.as_str()).size(13.0),
+                        );
+                    }
+                });
+        });
+
+        // 下拉没有"打到一半"的中间状态：一次点击就是一个完整决定，当场记为可落盘。
+        if picked != current {
+            if let Some(o) = items.get(picked) {
+                *value = o.value.clone();
+            }
+            match dirty.iter_mut().find(|(k, _)| *k == key) {
+                Some(entry) => entry.1 = true,
+                None => dirty.push((key, true)),
+            }
+        }
+    }
+
+    /// 攒着的改动什么时候写盘：有任意一项"改完了"（焦点离开该框 / 在该框里按了回车 /
+    /// 下拉框选了一项）就整批落盘。
     fn flush_settings_if_ready(&mut self) {
         if !self.settings_dirty.iter().any(|(_, done)| *done) {
             return;
@@ -2179,6 +2306,29 @@ impl AudioServerApp {
             ui.add_space(8.0);
         }
 
+        // ── 下拉选项（v3.8.1）──
+        // 每帧现建，不缓存：声道数和缓冲区的单位要跟着界面语言走，
+        // 而语言是可以在设置页里当场切换的（切完下一帧就是新文案）。
+        // 三组都是"合法取值就那么几个"的枚举：
+        //   采样率 ← WASAPI 混音格式实测常用档；
+        //   缓冲区 ← 2 的幂，太短会爆音、太长就是延迟；
+        //   声道数 ← config.rs 只放行 1 或 2。
+        let rate_options = number_options(&["44100", "48000", "96000", "192000"], " Hz");
+        let channel_options = vec![
+            ComboOption {
+                label: lang::t("settings.ch_mono"),
+                value: "1".to_string(),
+            },
+            ComboOption {
+                label: lang::t("settings.ch_stereo"),
+                value: "2".to_string(),
+            },
+        ];
+        let buffer_options = number_options(
+            &["256", "512", "1024", "2048", "4096"],
+            &format!(" {}", lang::t("settings.unit_frames")),
+        );
+
         // 音频参数卡片
         let audio_frame = egui::Frame::none()
             .fill(colors::BG_WHITE)
@@ -2206,10 +2356,11 @@ impl AudioServerApp {
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
-                                Self::config_text_edit(
+                                Self::config_dropdown(
                                     ui,
                                     &mut self.sample_rate,
                                     "speaker.sample_rate",
+                                    &rate_options,
                                     &mut self.settings_dirty,
                                 );
                             },
@@ -2224,10 +2375,11 @@ impl AudioServerApp {
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
-                                Self::config_text_edit(
+                                Self::config_dropdown(
                                     ui,
                                     &mut self.channels,
                                     "speaker.channels",
+                                    &channel_options,
                                     &mut self.settings_dirty,
                                 );
                             },
@@ -2242,10 +2394,11 @@ impl AudioServerApp {
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
-                                Self::config_text_edit(
+                                Self::config_dropdown(
                                     ui,
                                     &mut self.buffer_size,
                                     "speaker.buffer_frames",
+                                    &buffer_options,
                                     &mut self.settings_dirty,
                                 );
                             },
@@ -2284,11 +2437,14 @@ impl AudioServerApp {
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
+                                // 端口没有"就那么几个"的合法取值（0-65535 里除了占用都算对），
+                                // 所以保留手打，但只允许输入数字。
                                 Self::config_text_edit(
                                     ui,
                                     &mut self.port,
                                     "network.port",
                                     &mut self.settings_dirty,
+                                    true,
                                 );
                             },
                         );

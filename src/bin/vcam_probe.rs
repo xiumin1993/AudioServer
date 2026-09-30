@@ -1,24 +1,31 @@
 // vcam_probe —— 以"摄像头应用"的视角枚举 DirectShow 视频输入设备。
 // 用途：验证 Unity Capture 虚拟摄像头是否已被系统应用可见。
 // 运行：cargo run --bin vcam_probe
-#![cfg(windows)]
 
+#[cfg(windows)]
 use windows::core::{w, GUID, VARIANT};
+#[cfg(windows)]
 use windows::Win32::Media::DirectShow::ICreateDevEnum;
+#[cfg(windows)]
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, IEnumMoniker, IMoniker, CLSCTX_INPROC_SERVER,
     COINIT_APARTMENTTHREADED,
 };
+#[cfg(windows)]
 use windows::Win32::System::Com::StructuredStorage::IPropertyBag;
+#[cfg(windows)]
 use windows::Win32::Foundation::S_OK;
 
 // CLSID_SystemDeviceEnum = {62BE5D10-60EB-11d0-BD3B-00A0C911CE86}
+#[cfg(windows)]
 const CLSID_SYSTEM_DEVICE_ENUM: GUID =
     GUID::from_u128(0x62be5d10_60eb_11d0_bd3b_00a0c911ce86);
 // CLSID_VideoInputDeviceCategory = {860BB310-5D01-11d0-BD3B-00A0C911CE86}
+#[cfg(windows)]
 const VIDEO_INPUT_CATEGORY: GUID =
     GUID::from_u128(0x860bb310_5d01_11d0_bd3b_00a0c911ce86);
 
+#[cfg(windows)]
 fn main() {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
@@ -81,4 +88,12 @@ fn main() {
             println!("(未找到 Unity Capture 设备)");
         }
     }
+}
+
+// 非 Windows 平台（如 macOS）编译时给出的空实现：
+// 本探针只在 Windows 上有意义，但 bin 目标必须有一个 main，
+// 否则 cargo build 在其他平台会报 E0601（找不到 main）而整体失败。
+#[cfg(not(windows))]
+fn main() {
+    println!("This probe is Windows-only.");
 }

@@ -936,3 +936,107 @@ mod windows_impl {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 独立算一遍期望值（不复用 orient_bytes 的逆映射），逐像素比对。
+    ///
+    /// 映射约定（必须和手机端 CameraEngine.orientFlags 一致）：
+    ///   源像素 (x,y) 顺时针转 n 个 90° 后落到目标图的位置：
+    ///     0°   : (x,       y)
+    ///     90°  : (h-1-y,   x)
+    ///     180° : (w-1-x,   h-1-y)
+    ///     270° : (y,       w-1-x)
+    ///   之后再按 bit2 在【转正之后】的画面上做水平镜像。
+    fn expected(src: &[u8], w: usize, h: usize, bpp: usize, quarter: usize, mirror: bool) -> Vec<u8> {
+        let (ow, oh) = if quarter % 2 == 1 { (h, w) } else { (w, h) };
+        let mut out = vec![0u8; ow * oh * bpp];
+        for sy in 0..h {
+            for sx in 0..w {
+                let (mut tx, ty) = match quarter {
+                    0 => (sx, sy),
+                    1 => (h - 1 - sy, sx),
+                    2 => (w - 1 - sx, h - 1 - sy),
+                    _ => (sy, w - 1 - sx),
+                };
+                if mirror {
+                    tx = ow - 1 - tx;
+                }
+                let si = (sy * w + sx) * bpp;
+                let di = (ty * ow + tx) * bpp;
+                out[di..di + bpp].copy_from_slice(&src[si..si + bpp]);
+            }
+        }
+        out
+    }
+
+    /// 4 个角度 × 镜像开关 = 8 组，RGB(3) 与 RGBA(4) 各验一遍。
+    /// 镜像必须作用在转正【之后】的画面上 —— 若实现把它放到旋转之前
+    /// （H∘R ≠ R∘H），90°/270° 这两组会立刻对不上。
+    #[test]
+    fn orient_bytes_matches_independent_mapping() {
+        let (w, h) = (3usize, 2usize);
+        for bpp in [1usize, 3, 4] {
+            // 每像素填一个唯一值，像素位置错了就一定对不上
+            let n = w * h;
+            let mut src = vec![0u8; n * bpp];
+            for i in 0..n {
+                for c in 0..bpp {
+                    src[i * bpp + c] = (i * 7 + c) as u8;
+                }
+            }
+            for quarter in 0..4 {
+                for mirror in [false, true] {
+                    let orient = quarter as u8 | if mirror { 0x4 } else { 0 };
+                    let (got, ow, oh) = orient_bytes(&src, w as i32, h as i32, bpp, orient);
+                    let want = expected(&src, w, h, bpp, quarter, mirror);
+                    let exp_dims = if quarter % 2 == 1 { (h, w) } else { (w, h) };
+                    assert_eq!(
+                        (ow as usize, oh as usize),
+                        exp_dims,
+                        "bpp={bpp} quarter={quarter} mirror={mirror} 宽高应对换/保持正确"
+                    );
+                    assert_eq!(
+                        got, want,
+                        "bpp={bpp} quarter={quarter} mirror={mirror} 像素排布不一致"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 转两次 90° 应等于一次 180°（组合律），能兜住"方向反了"这类错。
+    #[test]
+    fn orient_bytes_90_twice_equals_180() {
+        let (w, h) = (4usize, 3usize);
+        let src: Vec<u8> = (0..(w * h * 3)).map(|i| (i * 5) as u8).collect();
+        let (once, ..) = orient_bytes(&src, w as i32, h as i32, 3, 1);
+        let w1 = h as i32;
+        let h1 = w as i32;
+        let (twice, ..) = orient_bytes(&once, w1, h1, 3, 1);
+        let (direct, ..) = orient_bytes(&src, w as i32, h as i32, 3, 2);
+        assert_eq!(twice, direct);
+    }
+
+    /// 新旧两种包都要认得：新包首字节是方向标记、次字节是 JPEG 的 SOI(FFD8)；
+    /// 旧包直接就是 JPEG。认错会导致手机升级后画面花屏或躺倒。
+    #[test]
+    fn split_orient_recognizes_both_layouts() {
+        let jpeg = [0xFFu8, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+        let mut new_pkt = vec![0b101u8]; // quarter=1, mirror=1
+        new_pkt.extend_from_slice(&jpeg);
+        let (orient, body) = split_orient(&new_pkt);
+        assert_eq!(orient, 0b101);
+        assert_eq!(body, &jpeg[..]);
+
+        let (orient_old, body_old) = split_orient(&jpeg);
+        assert_eq!(orient_old, 0, "旧包(无标记)应识别为 0 度");
+        assert_eq!(body_old, &jpeg[..]);
+
+        // 边界：包再短也不能 panic
+        assert_eq!(split_orient(&[]).0, 0);
+        assert_eq!(split_orient(&[0x01, 0xFF]).0, 0);
+    }
+}

@@ -60,6 +60,7 @@ use tokio_tungstenite::WebSocketStream;
 use crate::mic_out::{self, MicQueue};
 use crate::vcam::{self, FrameMailbox};
 use crate::vcam_obs;
+use crate::vcodec;
 
 // ── Windows FFI（外部函数接口）：直调系统 DLL 里的 COM 组件 ──────────
 // windows crate 把 Windows SDK 一比一绑成 Rust；COM 调用一律要写 unsafe，
@@ -1729,13 +1730,22 @@ async fn handle_connection(
                             cam_preview_hold = Some(payload);
                             cam_packets += 1;
                             cam_bytes_window += data.len() as u64;
-                            // 从 JPEG 头里读出这一帧的分辨率（用于 GUI 显示"当前画质"）。
-                            // 注意要先剥掉方向标记，否则从标记字节开始读会读不到 SOI。
-                            let (_orient, jpeg_only) = vcam::split_orient(&data[4..]);
-                            if let Some((w, h)) = jpeg_dims(jpeg_only) {
-                                // 转 90°/270° 后宽高互换 —— GUI 显示的是摆正后的画面
-                                let swap = (_orient & 0x3) % 2 == 1;
-                                cam_frame_dims = if swap { (h, w) } else { (w, h) };
+                            // 分辨率（用于 GUI 显示"当前画质"）：
+                            //   · JPEG 能直接从 SOI 头里读宽高（注意要先剥掉帧头字节）；
+                            //   · H.264/H.265 读不出来 —— 尺寸在 SPS 里，只有解码才知道，
+                            //     所以改用 vcodec 记住的"最近一次成功解码的尺寸"。
+                            let (codec, orient, body) = vcodec::split_frame(&data[4..]);
+                            if codec == vcodec::CODEC_JPEG {
+                                if let Some((w, h)) = jpeg_dims(body) {
+                                    // 转 90°/270° 后宽高互换 —— GUI 显示的是摆正后的画面
+                                    let swap = (orient & 0x3) % 2 == 1;
+                                    cam_frame_dims = if swap { (h, w) } else { (w, h) };
+                                }
+                            } else {
+                                let (w, h) = vcodec::last_dims();
+                                if w > 0 && h > 0 {
+                                    cam_frame_dims = (w, h);
+                                }
                             }
                             // 按 diagnostics.stat_interval_ms（默认 1000ms）推一次摄像头链路统计
                             let elapsed = cam_window_start.elapsed();

@@ -976,9 +976,9 @@ impl AudioServerApp {
                 self.cam_caps = Some(caps);
                 self.add_log(format!("[Cam] Capabilities reported by {}", ip));
             }
-            ServerEvent::CamFrame(jpeg) => {
+            ServerEvent::CamFrame(payload) => {
                 // 解码最新一帧 → 上传为 GUI 纹理（1fps，开销可忽略）
-                if let Some(tex) = decode_jpeg_to_texture(ctx, &jpeg) {
+                if let Some(tex) = decode_frame_to_texture(ctx, &payload) {
                     self.cam_texture = Some(tex);
                 }
             }
@@ -3835,25 +3835,16 @@ fn next_number(chars: &[char], idx: &mut usize) -> Option<u32> {
     chars[start..*idx].iter().collect::<String>().parse().ok()
 }
 
-/// v3.4：把手机上行的一帧 JPEG 解码成 egui 纹理（GUI 预览用）。
-/// jpeg_decoder 默认输出 RGB24，与 ColorImage::from_rgb 的期望一致。
-/// 解码失败（坏帧/网络截断）返回 None，界面保留上一帧不闪烁。
-fn decode_jpeg_to_texture(ctx: &egui::Context, jpeg: &[u8]) -> Option<egui::TextureHandle> {
-    // 【v3.10】jpeg 实际是 [方向标记][JPEG...]：先拆标记，解码后按它摆正。
-    // GUI 预览只有 1fps，在这里转一次 RGB 完全无感（旋转已经从手机搬到 PC）。
-    // 注意：main.rs 是独立 bin，vcam 在库 crate 里，必须用 audioserver:: 前缀
+/// 把手机上行的一帧解码成 egui 纹理（GUI 预览用）。
+///
+/// 【v3.16】手机端可以按硬件能力选 H.264 / H.265，这里不再只认 JPEG ——
+/// 格式识别、解码、按方向标记摆正全部交给 `audioserver::vcodec::decode_payload`，
+/// 本函数只负责把拿到的 RGB 像素交给 egui 上传。
+/// 解码失败（坏帧 / 网络截断 / 不支持的格式）返回 None，界面保留上一帧不闪烁。
+fn decode_frame_to_texture(ctx: &egui::Context, payload: &[u8]) -> Option<egui::TextureHandle> {
+    // 注意：main.rs 是独立 bin，vcodec 在库 crate 里，必须用 audioserver:: 前缀
     //（crate:: 指向 bin 自己，会报 E0433 "cannot find vcam in crate"）。
-    let (orient, jpeg_only) = audioserver::vcam::split_orient(jpeg);
-    let mut decoder = jpeg_decoder::Decoder::new(jpeg_only);
-    let pixels = decoder.decode().ok()?;
-    let info = decoder.info()?;
-    let (pixels, w, h) = audioserver::vcam::orient_bytes(
-        &pixels,
-        info.width as i32,
-        info.height as i32,
-        3, // RGB
-        orient,
-    );
+    let (pixels, w, h) = audioserver::vcodec::decode_payload(payload, 3).ok()?;
     let image = egui::ColorImage::from_rgb([w as usize, h as usize], &pixels);
     Some(ctx.load_texture("cam_frame", image, egui::TextureOptions::LINEAR))
 }

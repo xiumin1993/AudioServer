@@ -821,15 +821,13 @@ mod windows_impl {
             // 注意只取"最新一帧"：中间积压的旧帧早被 push_frame 覆盖了，直播宁丢帧不积延迟。
             let frame = mailbox.lock().unwrap().take();
             if let Some(payload) = frame {
-                // 【v3.10】同 Unity 通道：先拆方向标记，解码成 RGB 后按标记摆正。
-                let (orient, jpeg) = crate::vcam::split_orient(&payload);
-                match decode_jpeg_to_rgb(jpeg) {
-                    Ok((rgb0, w0, h0)) => {
-                        let (rgb, w, h) =
-                            crate::vcam::orient_bytes(&rgb0, w0 as i32, h0 as i32, 3, orient);
+                // 【v3.16】同 Unity 通道：格式识别 + 解码成 RGB + 按方向标记摆正，
+                // 全在 vcodec 一步做完（JPEG / H.264 / H.265 自动分流）。
+                match decode_frame_to_rgb(&payload) {
+                    Ok((rgb, w, h)) => {
                         if !first_frame_logged {
                             first_frame_logged = true;
-                            info!("[VcamObs] First JPEG from phone: {}x{}, mapping is {}x{}",
+                            info!("[VcamObs] 手机首帧: {}x{}, 映射 {}x{}",
                                 w, h, q_size.0, q_size.1);
                         }
 
@@ -882,7 +880,7 @@ mod windows_impl {
                             frames_dropped += 1;
                         }
                     }
-                    Err(e) => warn!("[VcamObs] JPEG decode failed: {e}"),
+                    Err(e) => warn!("[VcamObs] 画面解码失败: {e}"),
                 }
             } else if q.is_none()
                 && last_try.elapsed() >= Duration::from_millis(500)
@@ -935,28 +933,11 @@ mod windows_impl {
     //   decoder.info() 返回 Option，None 也会被 context 转成 Err（Option→Result 的桥）。
     // ensure!/bail! 是 anyhow 的宏：条件不成立就返回 Err / 无条件返回 Err，省写 if。
     // Ok((data, w, h))：最外层 Ok 包元组，成功就这么告诉调用方。
-    fn decode_jpeg_to_rgb(jpeg: &[u8]) -> anyhow::Result<(Vec<u8>, u32, u32)> {
-        use anyhow::Context;
-        let mut decoder = jpeg_decoder::Decoder::new(jpeg);
-        let data = decoder.decode()?;
-        let info = decoder.info().context("jpeg 流里没有图像帧")?;
-        let (w, h) = (info.width as u32, info.height as u32);
-        let npx = (w as usize) * (h as usize);
-        anyhow::ensure!(npx > 0, "空图像 {w}x{h}");
-        if data.len() == npx * 3 {
-            Ok((data, w, h))
-        } else if data.len() == npx {
-            // L8 灰度 → RGB24
-            let mut rgb = vec![0u8; npx * 3];
-            for (i, &g) in data.iter().enumerate() {
-                let o = i * 3;
-                rgb[o] = g;
-                rgb[o + 1] = g;
-                rgb[o + 2] = g;
-            }
-            Ok((rgb, w, h))
-        } else {
-            anyhow::bail!("未知 JPEG 输出格式: {} 字节 / {w}x{h}", data.len());
-        }
+    // 【v3.16】真正的解码已统一到 crate::vcodec::decode_payload：那边自动识别
+    // 上行帧是 JPEG / H.264 / H.265，解成 RGB 并按方向标记摆正。这里只把
+    // 返回的 i32 尺寸还原成本通道惯用的 u32，本文件不再留第二份解码实现。
+    fn decode_frame_to_rgb(payload: &[u8]) -> anyhow::Result<(Vec<u8>, u32, u32)> {
+        let (rgb, w, h) = crate::vcodec::decode_payload(payload, 3)?;
+        Ok((rgb, w as u32, h as u32))
     }
 }

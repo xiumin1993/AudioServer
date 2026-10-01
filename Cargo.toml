@@ -15,6 +15,17 @@ futures-util = "0.3"
 # JPEG 解码（手机上行摄像头帧 → RGBA）
 jpeg-decoder = "0.3"
 
+# H.264 / H.265(HEVC) 解码（手机端 MediaCodec 硬件编码的上行帧 → YUV → RGBA）
+# 选型说明：这两个是同族作者写的纯 Rust 解码器，API 一致（Decoder::new +
+# decode_nal），输入都是 Annex B 起始码流 —— 恰好就是 Android MediaCodec 的输出
+# 格式。选纯 Rust 而不是 openh264(C++)/ffmpeg-next(需系统库) 的理由：
+#   · 本项目 Mac 目标也要能编（Cargo.toml 里有 cfg(macos) 依赖段），
+#     引入 C/C++ 会要求目标机装好对应工具链与库，跨平台构建变脆；
+#   · 纯 Rust 无 build script、无 DLL 分发问题，Windows/Mac 一条 cargo build 通吃；
+#   · 我们的流是【全 I 帧】低延迟推流（无帧间依赖），解码成本远低于常规 P/B 视频。
+rust_h264 = "0.4"
+rust_h265 = "0.1"
+
 # 跨平台音频捕获（备用）
 cpal = "0.15"
 

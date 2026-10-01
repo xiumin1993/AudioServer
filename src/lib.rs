@@ -48,3 +48,7 @@ pub mod server;
 pub mod vcam;
 // vcam_obs —— src/vcam_obs.rs  ：虚拟摄像头之二（OBS 共享内存通道）
 pub mod vcam_obs;
+// vcodec —— src/vcodec.rs   ：上行画面帧的统一解码（JPEG / H.264 / H.265）
+//   手机端可以按硬件能力选编码器，三路消费端（Unity / OBS / GUI）都从这里取像素，
+//   不再各自判断格式。帧头格式与兼容规则见该文件顶部注释。
+pub mod vcodec;

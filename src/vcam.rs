@@ -99,11 +99,9 @@ pub fn push_frame(mailbox: &FrameMailbox, jpeg: Vec<u8>) {
 /// 为什么这么判：方向标记最大只用到 bit0~2（取值 0~7），永远不可能是 0xFF，
 /// 所以"第 1 字节是 0xFF 且第 2 字节是 0xD8"只可能是旧包，反过来一定是新包。
 pub fn split_orient(payload: &[u8]) -> (u8, &[u8]) {
-    if payload.len() > 3 && payload[1] == 0xFF && payload[2] == 0xD8 {
-        (payload[0], &payload[1..])
-    } else {
-        (0, payload)
-    }
+    // 【v3.16】实现搬到了 vcodec::split_frame（那边还要顺带拆出编码格式，
+    // 以支持 H.264/H.265）。这里保留签名是因为 server.rs / main.rs 都按它写。
+    crate::vcodec::split_orient(payload)
 }
 
 /// 按方向标记把像素缓冲摆正，返回 (新缓冲, 新宽, 新高)。
@@ -633,56 +631,11 @@ mod windows_impl {
     //   转成消费端要的 BGR(A) 由 filter 负责（文件头已注明）。
     // ⚠ 如果哪天画面变成"红蓝互换"（人脸发蓝、天空发红），第一嫌疑就是这两侧对字节序的理解
     //   错位了：要么 format 填错，要么有人在中间多做了一次 R/B 交换。改一处就能修好，别乱试。
-    // 性能提醒：下面两条分支都在做逐像素的搬运循环（960×720 约 69 万次），
-    //   但这段跑在引擎线程（非实时回调）上，8ms 一轮的节奏足够宽裕，可读性优先。
-    fn decode_jpeg_to_rgba(jpeg: &[u8]) -> anyhow::Result<(Vec<u8>, i32, i32)> {
-        // Context trait 给 Result 加 .context("...")：把 Err 换成带一句人话说明的错误，
-        //   这样 warn! 打出来的日志能看出"是没解出图像帧"，不只是一个裸错误码。
-        use anyhow::Context;
-        let mut decoder = jpeg_decoder::Decoder::new(jpeg);
-        // decode() 返回 Result<Vec<u8>>，? = 失败立刻把错误上抛给调用方（engine 的 Err 分支）。
-        //   decoder 之所以要 mut：decode 会往里写解码中间状态（Rust 要求改动就必须声明可变）。
-        let data = decoder.decode()?;
-        // info() 返回 Option<ImageInfo>：.context() 把 None 也转成错误（附带下面那句话），
-        //   于是又能继续用 ? 上抛 —— Option 和 Result 之间最常用的桥。
-        let info = decoder.info().context("jpeg 流里没有图像帧")?;
-        let (w, h) = (info.width as i32, info.height as i32);
-        let npx = (w as usize) * (h as usize);
-        // ensure! = "条件不成立就抛这个错误"（anyhow 提供的宏，省去手写 if + bail!）。
-        anyhow::ensure!(npx > 0, "空图像 {w}x{h}");
-
-        // RGBA 目的缓冲先全 0：下面 RGB24 分支会覆盖前 4 字节里的 3 个，A 单独写 255。
-        let mut rgba = vec![0u8; npx * 4];
-        if data.len() == npx * 3 {
-            // RGB24 → RGBA8（每 3 字节补一个 255）
-            // 用【输出长度】判断通道数而不是让库告诉我们是彩色/灰度：jpeg-decoder 0.3 的
-            //   ImageInfo 里没有直接的"每像素字节数"字段，长度比较反而是最不会骗人的依据。
-            // chunks_exact(3) 每次给一个像素的 3 个字节；enumerate() 再给一个序号 i（像素下标）。
-            //   偏移 o = i * 4 是"第 i 个像素在 RGBA 缓冲里的起始字节"。
-            for (i, px) in data.chunks_exact(3).enumerate() {
-                let o = i * 4;
-                rgba[o] = px[0];
-                rgba[o + 1] = px[1];
-                rgba[o + 2] = px[2];
-                rgba[o + 3] = 255;
-            }
-        } else if data.len() == npx {
-            // L8 灰度 → RGBA8（三通道同值）
-            // 灰度 JPEG 每像素 1 字节。R=G=B=同一个灰度值就是"没有颜色的彩色图"。
-            for (i, &g) in data.iter().enumerate() {
-                let o = i * 4;
-                rgba[o] = g;
-                rgba[o + 1] = g;
-                rgba[o + 2] = g;
-                rgba[o + 3] = 255;
-            }
-        } else {
-            // 兜底：长度既不是 npx*3 也不是 npx，说明遇到了没预料到的输出格式，
-            //   明确报错而不是硬猜（{:?}/数字塞进消息里方便日后按日志加一条分支）。
-            anyhow::bail!("未知 JPEG 输出格式: {} 字节 / {w}x{h}", data.len());
-        }
-        // 元组返回：调用方 engine 里 match Ok((rgba, w, h)) 一次解构三个值。
-        Ok((rgba, w, h))
+    // 【v3.16】解码已统一到 crate::vcodec::decode_payload：它自动识别上行帧的编码格式
+    // （JPEG / H.264 / H.265），解成 RGBA 并按方向标记摆正 —— 见 vcodec.rs 文件头。
+    // 原来这里的 JPEG→RGBA 逐像素搬运搬过去了，本文件不留第二份实现。
+    fn decode_frame_to_rgba(payload: &[u8]) -> anyhow::Result<(Vec<u8>, i32, i32)> {
+        crate::vcodec::decode_payload(payload, 4)
     }
 
     /// 引擎主循环：打开驱动共享内存 → 循环"取帧、解码、上传、探测活跃"
@@ -793,13 +746,12 @@ mod windows_impl {
             // 嵌套 match decode_jpeg_to_rgba(...)：Ok/Err 再各自处理，Result 就是"带错误信息的 Option"。
             let frame = mailbox.lock().unwrap().take();
             match frame {
-                // 【v3.10】邮箱里存的是 [方向标记][JPEG...]；先拆标记再解码，
-                // 解码成 RGBA 之后按标记摆正（旋转已从手机搬到 PC）。
+                // 【v3.16】邮箱里存的是 [(codec<<4)|orient][编码数据]：
+                // 格式识别（JPEG/H.264/H.265）+ 解码成 RGBA + 按方向标记摆正，
+                // 全在 vcodec 一步做完，这里不再自己拆标记。
                 Some(payload) => {
-                    let (orient, jpeg) = split_orient(&payload);
-                    match decode_jpeg_to_rgba(jpeg) {
-                    Ok((rgba0, w0, h0)) => {
-                        let (rgba, w, h) = orient_bytes(&rgba0, w0, h0, 4, orient);
+                    match decode_frame_to_rgba(&payload) {
+                    Ok((rgba, w, h)) => {
                         // 本函数内 send_frame 只有两处调用（这里的真实帧、第 4 步的黑帧），
                         //   签名是 (s, w, h, &像素)：s 是只读借用的 Sender，
                         //   w/h 必须与像素缓冲的宽高一致（否则步长算错 → 画面斜切/花屏）。
@@ -828,7 +780,7 @@ mod windows_impl {
                     }
                     // 解码失败：只打日志、不崩溃，也不上报错误状态 —— 手机侧下一帧大概率就是好的。
                     // {e} 走 Display（人话），如果用 {:?} 会走 Debug（带类型名的机器话）。
-                    Err(e) => warn!("[Vcam] JPEG decode failed: {e}"),
+                    Err(e) => warn!("[Vcam] 画面解码失败: {e}"),
                     }
                 }
                 None => {

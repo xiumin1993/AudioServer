@@ -3841,11 +3841,13 @@ fn next_number(chars: &[char], idx: &mut usize) -> Option<u32> {
 fn decode_jpeg_to_texture(ctx: &egui::Context, jpeg: &[u8]) -> Option<egui::TextureHandle> {
     // 【v3.10】jpeg 实际是 [方向标记][JPEG...]：先拆标记，解码后按它摆正。
     // GUI 预览只有 1fps，在这里转一次 RGB 完全无感（旋转已经从手机搬到 PC）。
-    let (orient, jpeg_only) = crate::vcam::split_orient(jpeg);
+    // 注意：main.rs 是独立 bin，vcam 在库 crate 里，必须用 audioserver:: 前缀
+    //（crate:: 指向 bin 自己，会报 E0433 "cannot find vcam in crate"）。
+    let (orient, jpeg_only) = audioserver::vcam::split_orient(jpeg);
     let mut decoder = jpeg_decoder::Decoder::new(jpeg_only);
     let pixels = decoder.decode().ok()?;
     let info = decoder.info()?;
-    let (pixels, w, h) = crate::vcam::orient_bytes(
+    let (pixels, w, h) = audioserver::vcam::orient_bytes(
         &pixels,
         info.width as i32,
         info.height as i32,

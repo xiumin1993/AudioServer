@@ -177,11 +177,34 @@ New-NetFirewallRule -DisplayName "AudioServer" -Direction Inbound -LocalPort 808
 Unity 通道**故意不用** `camera.width/height`：它的共享内存头必须跟手机真实推上来的分辨率
 一致，历史上写死分辨率导致过花屏，所以那条通道只吃 `placeholder_*` 与 `blackout_after_ms`。
 
+#### 哪些项已经能在界面里改（v3.8.2）
+
+设置页现在按"能枚举取值的一律下拉，不许手打"的原则重做过一遍，服务运行中相关控件会置灰
+（先停服务）。界面能改的键：
+
+| 页面 | 界面里的控件 | 对应配置键 |
+|------|--------------|-----------|
+| 音箱模式 → 设置 | 采样率 / 声道数 / 缓冲区大小（下拉，档位外的值显示为"自定义"）；端口（只允许数字）；麦克风使用时暂停音箱（开关） | `speaker.sample_rate`、`speaker.channels`、`speaker.buffer_frames`、`network.port`、`speaker.pause_while_mic_live` |
+| 音箱模式 → 设置 · 音频设备 | 捕获设备（下拉列出系统全部播放设备 + "系统默认（留空）"）、【重新检测设备】 | `speaker.capture_device_hint` |
+| 麦克风模式 → 设置 | 注入采样率 / 缓冲上限（下拉） | `mic.uplink_sample_rate`、`mic.max_queue_ms` |
+| 麦克风模式 → 设置 · 注入设备 | 注入设备、监听设备（分别列出系统全部播放/录音设备 + "默认（VB-CABLE）"）、【重新检测设备】 | `mic.inject_device_hint`、`mic.monitor_capture_hint` |
+| 摄像头模式 → 设置 | 分辨率（6 档下拉）、帧率（4 档下拉）、Unity / OBS 两条通道开关 | `camera.width`、`camera.height`、`camera.fps`、`camera.unity_enabled`、`camera.obs_enabled` |
+| 三个页面的 语言 / 诊断 卡片 | 语言三档；日志级别（下拉，**改完立刻生效不用重启**）；启动时额外开控制台（开关） | `language`、`diagnostics.log_level`、`diagnostics.show_console` |
+
+设备下拉有个细节：配置里存的是**名片段**（运行时按不区分大小写的子串匹配），而下拉显示的是
+枚举到的**完整设备名**。出厂的 `"CABLE Input"` 会显示成 `"CABLE Input (VB-Audio Virtual Cable)"`
+并处于选中状态——再点它一次不会把你的片段改掉，只有选别的设备才写入新的完整名。
+
+仍然只能改文件的：`network.bind`、`network.ping_interval_ms`、
+`camera.placeholder_width/height`、`camera.blackout_after_ms`、
+`diagnostics.stat_interval_ms`、`diagnostics.skip_env_check`（这几个是排障/开发用的，
+故意不放进界面，免得普通用户误点）。
+
 #### 怎么改
 
-- **图形界面**：设置页里的端口/采样率/声道/缓冲区/暂停下行，改完失焦或按回车就写回
-  `config.json`（服务运行中这些输入框是灰的，先停服务）。
-- **直接编辑文件**：硬件类项目（设备名、虚拟摄像头分辨率、通道开关）目前只能这样改。
+- **图形界面**：见上表，改完失焦或按回车（下拉是一次点击）就写回 `config.json`。
+  每次落盘日志里都有一行 `[Config] saved N field(s)`，日志页能直接看到。
+- **直接编辑文件**：上表没覆盖的键，以及想一次改多项时用这条路径。
 - **命令行版**：`server.exe --port ... --sample-rate ...` 等参数仍然有效，是临时覆盖。
 - **要一份权威默认值**：`server.exe --print-default-config` 打印当前二进制内嵌的默认配置
   （打包脚本就是用它生成安装器里那份 `config.default.json`，所以文档/安装包/程序三者

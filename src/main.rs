@@ -285,6 +285,41 @@ fn number_options(values: &[&str], suffix: &str) -> Vec<ComboOption> {
         .collect()
 }
 
+/// 列出本机音频设备的友好名，分成（播放设备, 录音设备）两摞。
+///
+/// 为什么要列：这三项设备选择以前只能手改 config.json 里的字符串，
+/// 拼错一个字母就静默退回默认设备，排查半天。做成下拉就点不错了。
+/// 用 cpal 而不是自己写 WASAPI 枚举：cpal 本来就是依赖（Mac 侧在用），
+/// 同一份代码在 Mac 上也能列出 CoreAudio 设备，不用加 #[cfg] 分支。
+/// 失败（无声卡、驱动异常）就返回空表 —— 下拉里只剩"自定义/系统默认"，
+/// 界面照常能用，绝不因为枚举失败而让程序起不来。
+fn audio_devices() -> (Vec<String>, Vec<String>) {
+    // trait 不 import 进来，host.output_devices() / d.name() 就"找不到方法"
+    use cpal::traits::{DeviceTrait, HostTrait};
+
+    let host = cpal::default_host();
+    let mut outputs = Vec::new();
+    let mut inputs = Vec::new();
+
+    for (label, list, sink) in [
+        ("output", host.output_devices(), &mut outputs),
+        ("input", host.input_devices(), &mut inputs),
+    ] {
+        match list {
+            Ok(devs) => {
+                for d in devs {
+                    let name = d.name().unwrap_or_default();
+                    if !name.is_empty() {
+                        sink.push(name);
+                    }
+                }
+            }
+            Err(e) => log::warn!("[Gui] enumerate {label} devices failed: {e}"),
+        }
+    }
+    (outputs, inputs)
+}
+
 /// 把界面上那串 "960x720" 拆成 (宽, 高)。
 /// 分隔符同时认 x / X / ×：下拉里给的是小写 x，但用户手改 config.json 时
 /// 可能照着界面上"960×720"那种排版写，别为难他。
@@ -589,6 +624,17 @@ struct AudioServerApp {
     mic_uplink_rate: String,
     /// 上行抖动缓冲上限：网络抖动超过这个时长就丢帧保实时，不再往后堆延迟
     mic_max_queue_ms: String,
+    // ── v3.8.2：音频设备下拉（以前只能手改 config.json 里的字符串）──
+    /// 音箱模式回环捕获用的播放设备名（空 = 系统默认）
+    capture_device: String,
+    /// 麦克风模式上行注入用的播放设备名（默认匹配 CABLE Input）
+    inject_device: String,
+    /// "有没有应用正在用这根线"要监听的录音设备名
+    monitor_device: String,
+    /// 启动时枚举一次的全部播放设备（下拉列表的数据源）
+    output_devices: Vec<String>,
+    /// 启动时枚举一次的全部录音设备
+    input_devices: Vec<String>,
 }
 
 impl AudioServerApp {
@@ -639,7 +685,15 @@ impl AudioServerApp {
             show_console: cfg.diagnostics.show_console,
             mic_uplink_rate: cfg.mic.uplink_sample_rate.to_string(),
             mic_max_queue_ms: cfg.mic.max_queue_ms.to_string(),
+            capture_device: cfg.speaker.capture_device_hint.clone(),
+            inject_device: cfg.mic.inject_device_hint.clone(),
+            monitor_device: cfg.mic.monitor_capture_hint.clone(),
+            // 只在启动时枚举一次：cpal 每次调用都要过一遍 WASAPI 的 IMMDeviceEnumerator，
+            // 放在 update() 里就是每帧几十毫秒的系统调用。设备插拔了用旁边的"重新检测"。
+            output_devices: Vec::new(),
+            input_devices: Vec::new(),
         };
+        app.refresh_audio_devices();
         // v3.5：启动先做一次【只读】环境自检（不写注册表、不装任何东西）。
         //   · 必需驱动齐 → 和以前一样，自动开启服务端
         //   · 缺驱动     → 不起服务端线程，主窗口只显示"环境准备"向导页，
@@ -934,6 +988,71 @@ impl AudioServerApp {
         options: &[ComboOption],
         dirty: &mut Vec<(&'static str, bool)>,
     ) {
+        Self::dropdown_at_width(ui, value, key, options, dirty, 120.0);
+    }
+
+    /// 音频设备下拉：设备名动辄三四十个字符（"Digital Audio (S/PDIF) (High Definition
+    /// Audio Device)"），120px 只够看见前几个字，所以这一种占满整行宽。
+    /// `default_label` = Some(文字) 时列表第一项是"留空 = 用默认"，文字由调用方给，
+    /// 因为两处"默认"的含义不一样：
+    ///   · 音箱捕获留空 → 跟着系统默认播放设备走；
+    ///   · 麦克风注入留空 → 回到 VB-CABLE 的固定名（mic_out 里是安全默认，
+    ///     绝不允许"随便挑一台设备"，否则手机声音会直接灌进真实扬声器变成啸叫）。
+    fn device_dropdown(
+        ui: &mut egui::Ui,
+        value: &mut String,
+        key: &'static str,
+        devices: &[String],
+        default_label: Option<String>,
+        dirty: &mut Vec<(&'static str, bool)>,
+    ) {
+        let mut options: Vec<ComboOption> = Vec::with_capacity(devices.len() + 1);
+        let allow_default = default_label.is_some();
+        if let Some(label) = default_label {
+            options.push(ComboOption {
+                label,
+                value: String::new(),
+            });
+        }
+        // 配置里存的其实是"名片段"：server / mic_out 匹配设备用的是不区分大小写的
+        // contains（"CABLE Input" 能匹上 "CABLE Input (VB-Audio Virtual Cable)"）。
+        // 枚举出来的是完整名，如果直接照搬，出厂默认值会显示成莫名其妙的
+        // "自定义 CABLE Input"。所以这里把"当前片段恰好匹配到的那一台"的值写成
+        // 用户现有的片段：打开下拉它显示为选中项，再点它一次配置字符串原样不动
+        // （绝不做静默改写 —— 用户手打的片段可能有他的道理）。
+        let needle = value.trim().to_lowercase();
+        let mut matched = false;
+        for d in devices {
+            let hit = !needle.is_empty() && !matched && d.to_lowercase().contains(&needle);
+            if hit {
+                matched = true;
+            }
+            options.push(ComboOption {
+                label: d.clone(),
+                value: if hit { value.trim().to_string() } else { d.clone() },
+            });
+        }
+        // 一台设备都没有（无声卡 / 驱动异常）：列表不能是空的，否则点开一片空白，
+        // 用户以为程序坏了。给一行"未检测到"，它对应的值就是当前值 —— 选了也不改动配置。
+        if devices.is_empty() && !allow_default {
+            options.push(ComboOption {
+                label: lang::t("settings.no_devices"),
+                value: value.clone(),
+            });
+        }
+        // 减 14 是给右边的下拉箭头留位置；再窄也保底 160px，别让名字缩成一个字
+        let width = (ui.available_width() - 14.0).max(160.0);
+        Self::dropdown_at_width(ui, value, key, &options, dirty, width);
+    }
+
+    fn dropdown_at_width(
+        ui: &mut egui::Ui,
+        value: &mut String,
+        key: &'static str,
+        options: &[ComboOption],
+        dirty: &mut Vec<(&'static str, bool)>,
+        width: f32,
+    ) {
         let mut items: Vec<ComboOption> = options.to_vec();
         let mut current = items.iter().position(|o| o.value == *value);
         if current.is_none() {
@@ -981,8 +1100,10 @@ impl AudioServerApp {
             }
             egui::ComboBox::from_id_salt(key)
                 .selected_text(egui::RichText::new(selected_label).size(13.0))
-                // 按钮和弹出列表同宽：120px 装得下 "192000 Hz" 和 "自定义（1234）"
-                .width(120.0)
+                // 按钮和弹出列表同宽：120px 装得下 "192000 Hz"；设备下拉另外占满整行
+                .width(width)
+                // 设备名超出宽度时截断显示，不把整张设置页撑破
+                .truncate()
                 .show_ui(ui, |ui| {
                     for (i, o) in items.iter().enumerate() {
                         ui.selectable_value(
@@ -1015,6 +1136,19 @@ impl AudioServerApp {
         let entries = std::mem::take(&mut self.settings_dirty);
         let keys: Vec<&'static str> = entries.into_iter().map(|(k, _)| k).collect();
         self.persist_settings(&keys);
+    }
+
+    /// 重新枚举一遍音频设备，填进设置页那几个设备下拉。
+    /// 启动时调一次；插了耳机 / 新装了虚拟声卡不必重启程序，点设置页的【重新检测】即可。
+    fn refresh_audio_devices(&mut self) {
+        let (outputs, inputs) = audio_devices();
+        log::info!(
+            "[Gui] audio devices: {} output, {} input",
+            outputs.len(),
+            inputs.len()
+        );
+        self.output_devices = outputs;
+        self.input_devices = inputs;
     }
 
     /// 把界面上的音频/网络参数 + "麦忙时暂停外放"写回 config.json。
@@ -1056,6 +1190,15 @@ impl AudioServerApp {
                     Ok(v) => cfg.mic.max_queue_ms = v,
                     Err(_) => rejected.push(key),
                 },
+                // 设备名是字符串，没有"打到一半"的非法中间态（下拉里选出来的必是完整名），
+                // 所以直接赋值。空格两端会被 config::sanitize 里 trim 掉。
+                "speaker.capture_device_hint" => {
+                    cfg.speaker.capture_device_hint = self.capture_device.clone();
+                }
+                "mic.inject_device_hint" => cfg.mic.inject_device_hint = self.inject_device.clone(),
+                "mic.monitor_capture_hint" => {
+                    cfg.mic.monitor_capture_hint = self.monitor_device.clone();
+                }
                 // 分辨率在界面上是一整串 "960x720"，这里拆成两个数分别落盘。
                 // 拆不出来（用户手改过 config.json 里的宽或高，组合不在选项里）
                 // 时保留旧值，别把一半写进去。
@@ -1100,6 +1243,9 @@ impl AudioServerApp {
                 self.cam_obs = saved.camera.obs_enabled;
                 self.log_level = saved.diagnostics.log_level.clone();
                 self.show_console = saved.diagnostics.show_console;
+                self.capture_device = saved.speaker.capture_device_hint.clone();
+                self.inject_device = saved.mic.inject_device_hint.clone();
+                self.monitor_device = saved.mic.monitor_capture_hint.clone();
                 // 日志级别是这一堆里唯一【不用重启】就生效的：当场换掉过滤器，
                 // 下一行日志就按新级别走。其余（端口/采样率/设备/控制台）都要重启。
                 if keys.contains(&"diagnostics.log_level") {
@@ -2703,6 +2849,64 @@ impl AudioServerApp {
 
         ui.add_space(8.0);
 
+        // ── 音频设备卡片（v3.8.2）──────────────────────────────────────
+        // 设备选择以前只存在于 config.json 的字符串里：拼错一个字母不会报错，
+        // 只会静默退回默认设备 —— 正是最难查的那种"怎么没声音"。
+        // 现在把系统里真实存在的设备枚举出来挑，选出来的名字一定是这台机器上有的。
+        let dev_frame = egui::Frame::none()
+            .fill(colors::BG_WHITE)
+            .stroke(egui::Stroke::new(1.0_f32, colors::BORDER))
+            .rounding(8.0)
+            .inner_margin(egui::Margin::same(14.0));
+        // 为什么先 clone 一份设备表：同一次调用里既要 &self.output_devices（不可变）
+        // 又要 &mut self.settings_dirty（可变），Rust 不允许同时借两次 self。
+        // 这里是十几条短字符串，而且只在设置页被重绘时走到（不是每帧，见 update() 的按需重绘）。
+        let outputs = self.output_devices.clone();
+        let mut rescan = false;
+        dev_frame.show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(lang::t("settings.device"))
+                    .size(11.0)
+                    .color(colors::TEXT_MUTED),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(lang::t("settings.capture_device"))
+                    .size(13.0)
+                    .color(colors::TEXT_SECONDARY),
+            );
+            ui.add_space(2.0);
+            // 和采样率同理：服务跑起来之后两条 WASAPI 通道已经按当前设备建好了，
+            // 中途换设备不会让正在推的声音改道，只会让人以为改了没生效 → 锁住。
+            ui.add_enabled_ui(!is_running, |ui| {
+                Self::device_dropdown(
+                    ui,
+                    &mut self.capture_device,
+                    "speaker.capture_device_hint",
+                    &outputs,
+                    // 留空 = 跟着系统默认播放设备走（server.rs 里没匹配到也是这个行为）
+                    Some(lang::t("settings.system_default")),
+                    &mut self.settings_dirty,
+                );
+            });
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(lang::t("settings.capture_device_hint"))
+                    .size(11.0)
+                    .color(colors::TEXT_MUTED),
+            );
+            ui.add_space(6.0);
+            // 枚举只在启动时做一次，插了耳机 / 新装虚拟声卡得有个不重启就能重扫的口子
+            if ui.button(lang::t("settings.rescan_devices")).clicked() {
+                rescan = true;
+            }
+        });
+        if rescan {
+            self.refresh_audio_devices();
+        }
+
+        ui.add_space(8.0);
+
         // 网络参数卡片
         let net_frame = egui::Frame::none()
             .fill(colors::BG_WHITE)
@@ -2963,6 +3167,81 @@ impl AudioServerApp {
                     .color(colors::TEXT_MUTED),
             );
         });
+
+        // ── 注入设备（v3.8.2 下拉化）──────────────────────────────────
+        // 这两项是整套"手机当麦克风"里最容易配错的地方：注入端要选虚拟声卡的
+        // 【输入】(CABLE Input)，占用检测要选它的【输出】(CABLE Output)，
+        // 两条必须描述同一根线，配错了表现是"引擎显示正常但全场静音"。
+        // 以前只能对着 config.json 手打字符串，现在直接从系统设备里挑。
+        let card4 = egui::Frame::none()
+            .fill(colors::BG_WHITE)
+            .stroke(egui::Stroke::new(1.0_f32, colors::BORDER))
+            .rounding(8.0)
+            .inner_margin(egui::Margin::same(14.0));
+        let outputs = self.output_devices.clone();
+        let inputs = self.input_devices.clone();
+        let mut rescan = false;
+        card4.show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(lang::t("settings.inject_device_card"))
+                    .size(11.0)
+                    .color(colors::TEXT_MUTED),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(lang::t("settings.inject_device"))
+                    .size(13.0)
+                    .color(colors::TEXT_SECONDARY),
+            );
+            ui.add_space(2.0);
+            ui.add_enabled_ui(!is_running, |ui| {
+                Self::device_dropdown(
+                    ui,
+                    &mut self.inject_device,
+                    "mic.inject_device_hint",
+                    &outputs,
+                    Some(lang::t("settings.cable_default")),
+                    &mut self.settings_dirty,
+                );
+            });
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(lang::t("settings.inject_device_hint"))
+                    .size(11.0)
+                    .color(colors::TEXT_MUTED),
+            );
+            ui.add_space(10.0);
+
+            ui.label(
+                egui::RichText::new(lang::t("settings.monitor_device"))
+                    .size(13.0)
+                    .color(colors::TEXT_SECONDARY),
+            );
+            ui.add_space(2.0);
+            ui.add_enabled_ui(!is_running, |ui| {
+                Self::device_dropdown(
+                    ui,
+                    &mut self.monitor_device,
+                    "mic.monitor_capture_hint",
+                    &inputs,
+                    Some(lang::t("settings.cable_default")),
+                    &mut self.settings_dirty,
+                );
+            });
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(lang::t("settings.monitor_device_hint"))
+                    .size(11.0)
+                    .color(colors::TEXT_MUTED),
+            );
+            ui.add_space(6.0);
+            if ui.button(lang::t("settings.rescan_devices")).clicked() {
+                rescan = true;
+            }
+        });
+        if rescan {
+            self.refresh_audio_devices();
+        }
     }
 
     // ── Log Tab ──

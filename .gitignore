@@ -26,6 +26,13 @@ ui-design*.html
 # 运行/构建日志
 *.log
 
+# 打包产物兜底（dist/ 已忽略；这里防 exe / 安装包散落在根目录被误提交）
+*.exe
+*.msi
+
+# Inno Setup 编译输出目录（installer/Output）
+installer/Output/
+
 # 第三方参考源码（UnityCapture 官方包解压产物）：新机器 cargo build 一行都用不到
 # —— 没有 build.rs，也没有任何 C++ 参与编译，共享内存协议是照 shared.inl 手写的。
 # 按「构建不需要的文件不入库」原则不再跟踪，只留在本地磁盘。

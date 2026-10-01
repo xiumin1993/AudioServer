@@ -1396,6 +1396,38 @@ async fn handle_connection(
         }
     }
 
+    // ── v3.8：补发 cam_request，收拾"手机晚于 PC 应用连上来"的时序漏洞 ──
+    // 原来的 cam_request 只在"有应用开始观看虚拟摄像头"的【翻转瞬间】广播一次
+    // （见 run_server 里 cam_live 的 swap 分支）。若那一刻还没有任何手机在线，
+    // 这条广播就打给了空气；之后观看状态一直保持 true 不再翻转，
+    // 于是永远不会再补发一次 —— 手机从头到尾收不到 cam_request，
+    // 界面只能一直停在"待电脑请求"。典型触发顺序：先开 PC 上的取景程序，
+    // 再启动手机 App（或中途重连）。
+    // 修法：每条新连接在握手成功后自查一次 —— 此刻有人在看 + 手机会话还没登记
+    // → 给【这一条】连接单独补发一次 cam_request。补的是"错过那一枪"，
+    //   顺序谁先谁后都能自动接管，不需要用户去 GUI 上点按钮。
+    let watching_no_session = client_manager.cam_live.load(Ordering::Relaxed)
+        && !client_manager.cam_session.load(Ordering::Relaxed);
+    if watching_no_session {
+        {
+            let mut sink = ws_sink.lock().await;
+            let _ = sink
+                .send(Message::Text(r#"{"type":"cam_request"}"#.to_string()))
+                .await;
+        }
+        info!(
+            "[Cam] New client {} arrived while an app is watching → resent cam_request to it",
+            client_key
+        );
+        event_tx
+            .send(ServerEvent::Log(format!(
+                "[Cam] App is watching the virtual camera but no phone session → \
+                 resent cam_request to {}",
+                client_key
+            )))
+            .ok();
+    }
+
     // v3.8：心跳 / 统计间隔从 config.json 取。每个连接建立时读一次内存里那份配置，
     // 绝不在循环里读 —— 配置改了下一次连接才生效，这是有意的（连接中途改节奏没意义）。
     // ping_ms（默认 5000ms）：发 WebSocket Ping 帧的周期，兼当断线探测器；

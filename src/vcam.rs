@@ -91,6 +91,66 @@ pub fn push_frame(mailbox: &FrameMailbox, jpeg: Vec<u8>) {
     *mailbox.lock().unwrap() = Some(jpeg);
 }
 
+/// 从帧载荷里拆出【方向标记】与 JPEG 本体。
+///
+/// 兼容两种布局，靠 JPEG 自己的 SOI 标记（FF D8）自动判断，不靠版本号：
+///   · 新包：[orient][FF D8 ...] → (orient, 去掉标记字节的部分)
+///   · 旧包：[FF D8 ...]         → (0,      整包)
+/// 为什么这么判：方向标记最大只用到 bit0~2（取值 0~7），永远不可能是 0xFF，
+/// 所以"第 1 字节是 0xFF 且第 2 字节是 0xD8"只可能是旧包，反过来一定是新包。
+pub fn split_orient(payload: &[u8]) -> (u8, &[u8]) {
+    if payload.len() > 3 && payload[1] == 0xFF && payload[2] == 0xD8 {
+        (payload[0], &payload[1..])
+    } else {
+        (0, payload)
+    }
+}
+
+/// 按方向标记把像素缓冲摆正，返回 (新缓冲, 新宽, 新高)。
+///
+/// orient 的含义（与手机端 CameraEngine.orientFlags 一一对应）：
+///   bit0~1 = 需要【顺时针】转几个 90°（0~3）
+///   bit2   = 水平镜像，作用在【转正之后】的画面上
+///
+/// 【v3.10】旋转从手机搬到了这里：手机上做同样的事要遍历 NV21 的全部像素
+/// 且带缩放装裱（实测 27~28ms/帧），PC 上解码后直接在 RGBA/RGB 上重排，
+/// 一帧约 69 万像素、几毫秒 —— 对 PC 可忽略，却给手机省下一大截 CPU。
+/// bpp = 每像素字节数（RGBA=4、RGB=3）。
+pub fn orient_bytes(
+    src: &[u8], w: i32, h: i32, bpp: usize, orient: u8,
+) -> (Vec<u8>, i32, i32) {
+    let (w, h) = (w as usize, h as usize);
+    if w == 0 || h == 0 || bpp == 0 || src.len() < w * h * bpp {
+        return (Vec::new(), w as i32, h as i32);
+    }
+    let quarter = (orient & 0x3) as usize;
+    let mirror = (orient & 0x4) != 0;
+    // 转 90°/270° 时宽高互换
+    let (ow, oh) = if quarter % 2 == 1 { (h, w) } else { (w, h) };
+    let mut out = vec![0u8; ow * oh * bpp];
+    // 目标像素 (dx,dy) 该采源图的哪个像素 —— 四种朝向各自一行映射：
+    //   0°   : (dx, dy)
+    //   90°  : (dy, h-1-dx)       顺时针 90°（顶行变成右列）
+    //   180° : (w-1-dx, h-1-dy)
+    //   270° : (w-1-dy, dx)
+    for dy in 0..oh {
+        for dx in 0..ow {
+            let (sx, sy) = match quarter {
+                0 => (dx, dy),
+                1 => (dy, h - 1 - dx),
+                2 => (w - 1 - dx, h - 1 - dy),
+                _ => (w - 1 - dy, dx),
+            };
+            // 镜像放在最后：把算好的值写到"水平翻转后"的目标位置
+            let fx = if mirror { ow - 1 - dx } else { dx };
+            let si = (sy * w + sx) * bpp;
+            let di = (dy * ow + fx) * bpp;
+            out[di..di + bpp].copy_from_slice(&src[si..si + bpp]);
+        }
+    }
+    (out, ow as i32, oh as i32)
+}
+
 /// 启动注入引擎线程（仅 Windows；其他平台是空 stub）。
 /// tx 在"是否有应用正在观看摄像头"状态翻转时回传（true=正在被取流）。
 // #[cfg(windows)] / #[cfg(not(windows))]：属性，决定这段代码参不参与编译。
@@ -733,8 +793,13 @@ mod windows_impl {
             // 嵌套 match decode_jpeg_to_rgba(...)：Ok/Err 再各自处理，Result 就是"带错误信息的 Option"。
             let frame = mailbox.lock().unwrap().take();
             match frame {
-                Some(jpeg) => match decode_jpeg_to_rgba(&jpeg) {
-                    Ok((rgba, w, h)) => {
+                // 【v3.10】邮箱里存的是 [方向标记][JPEG...]；先拆标记再解码，
+                // 解码成 RGBA 之后按标记摆正（旋转已从手机搬到 PC）。
+                Some(payload) => {
+                    let (orient, jpeg) = split_orient(&payload);
+                    match decode_jpeg_to_rgba(jpeg) {
+                    Ok((rgba0, w0, h0)) => {
+                        let (rgba, w, h) = orient_bytes(&rgba0, w0, h0, 4, orient);
                         // 本函数内 send_frame 只有两处调用（这里的真实帧、第 4 步的黑帧），
                         //   签名是 (s, w, h, &像素)：s 是只读借用的 Sender，
                         //   w/h 必须与像素缓冲的宽高一致（否则步长算错 → 画面斜切/花屏）。
@@ -764,7 +829,8 @@ mod windows_impl {
                     // 解码失败：只打日志、不崩溃，也不上报错误状态 —— 手机侧下一帧大概率就是好的。
                     // {e} 走 Display（人话），如果用 {:?} 会走 Debug（带类型名的机器话）。
                     Err(e) => warn!("[Vcam] JPEG decode failed: {e}"),
-                },
+                    }
+                }
                 None => {
                     // 没有新帧，但应用确实在等 → 立刻应答 Sent，让它继续用共享内存
                     // 里的上一帧。不应答的话 filter 要白等 200ms 才拿到 OLDFRAME，

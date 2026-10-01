@@ -1717,18 +1717,25 @@ async fn handle_connection(
                     if data.len() > 4 && data[0] == 0x03 && &data[1..4] == b"CAM" {
                         // 有 CAM 会话才消费；没登记 = 帧直接丢（隐私默认关闭）
                         if cam_session_recv.load(Ordering::Relaxed) {
-                            let jpeg = data[4..].to_vec();
+                            // 【v3.10】data[4..] 是 [方向标记][JPEG...]：
+                            // 标记字节跟着帧走，由下游（vcam / vcam_obs / GUI）各自拆。
+                            // 旧版手机没有这个字节 —— split_orient 会自动识别，不用版本号。
+                            let payload = data[4..].to_vec();
                             // v3.4 双通道：同一帧分别投给两个引擎的邮箱
                             //（clone 一份给 OBS 路，Unity 路用原件）
-                            vcam::push_frame(&mgr_recv.cam_mailbox, jpeg.clone());
-                            vcam_obs::push_frame(&mgr_recv.cam_mailbox_obs, jpeg);
+                            vcam::push_frame(&mgr_recv.cam_mailbox, payload.clone());
+                            vcam_obs::push_frame(&mgr_recv.cam_mailbox_obs, payload.clone());
                             // 给 GUI 预览攒下窗口内最新一帧（到统计点 take 走）
-                            cam_preview_hold = Some(data[4..].to_vec());
+                            cam_preview_hold = Some(payload);
                             cam_packets += 1;
                             cam_bytes_window += data.len() as u64;
-                            // 从 JPEG 头里读出这一帧的分辨率（用于 GUI 显示"当前画质"）
-                            if let Some((w, h)) = jpeg_dims(&data[4..]) {
-                                cam_frame_dims = (w, h);
+                            // 从 JPEG 头里读出这一帧的分辨率（用于 GUI 显示"当前画质"）。
+                            // 注意要先剥掉方向标记，否则从标记字节开始读会读不到 SOI。
+                            let (_orient, jpeg_only) = vcam::split_orient(&data[4..]);
+                            if let Some((w, h)) = jpeg_dims(jpeg_only) {
+                                // 转 90°/270° 后宽高互换 —— GUI 显示的是摆正后的画面
+                                let swap = (_orient & 0x3) % 2 == 1;
+                                cam_frame_dims = if swap { (h, w) } else { (w, h) };
                             }
                             // 按 diagnostics.stat_interval_ms（默认 1000ms）推一次摄像头链路统计
                             let elapsed = cam_window_start.elapsed();

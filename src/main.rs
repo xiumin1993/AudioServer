@@ -3839,11 +3839,20 @@ fn next_number(chars: &[char], idx: &mut usize) -> Option<u32> {
 /// jpeg_decoder 默认输出 RGB24，与 ColorImage::from_rgb 的期望一致。
 /// 解码失败（坏帧/网络截断）返回 None，界面保留上一帧不闪烁。
 fn decode_jpeg_to_texture(ctx: &egui::Context, jpeg: &[u8]) -> Option<egui::TextureHandle> {
-    let mut decoder = jpeg_decoder::Decoder::new(jpeg);
+    // 【v3.10】jpeg 实际是 [方向标记][JPEG...]：先拆标记，解码后按它摆正。
+    // GUI 预览只有 1fps，在这里转一次 RGB 完全无感（旋转已经从手机搬到 PC）。
+    let (orient, jpeg_only) = crate::vcam::split_orient(jpeg);
+    let mut decoder = jpeg_decoder::Decoder::new(jpeg_only);
     let pixels = decoder.decode().ok()?;
     let info = decoder.info()?;
-    let image =
-        egui::ColorImage::from_rgb([info.width as usize, info.height as usize], &pixels);
+    let (pixels, w, h) = crate::vcam::orient_bytes(
+        &pixels,
+        info.width as i32,
+        info.height as i32,
+        3, // RGB
+        orient,
+    );
+    let image = egui::ColorImage::from_rgb([w as usize, h as usize], &pixels);
     Some(ctx.load_texture("cam_frame", image, egui::TextureOptions::LINEAR))
 }
 

@@ -820,9 +820,13 @@ mod windows_impl {
             //   take() 把 Some(jpeg) 整个【挪走】留下 None —— 不复制字节，天然防重复消费。
             // 注意只取"最新一帧"：中间积压的旧帧早被 push_frame 覆盖了，直播宁丢帧不积延迟。
             let frame = mailbox.lock().unwrap().take();
-            if let Some(jpeg) = frame {
-                match decode_jpeg_to_rgb(&jpeg) {
-                    Ok((rgb, w, h)) => {
+            if let Some(payload) = frame {
+                // 【v3.10】同 Unity 通道：先拆方向标记，解码成 RGB 后按标记摆正。
+                let (orient, jpeg) = crate::vcam::split_orient(&payload);
+                match decode_jpeg_to_rgb(jpeg) {
+                    Ok((rgb0, w0, h0)) => {
+                        let (rgb, w, h) =
+                            crate::vcam::orient_bytes(&rgb0, w0 as i32, h0 as i32, 3, orient);
                         if !first_frame_logged {
                             first_frame_logged = true;
                             info!("[VcamObs] First JPEG from phone: {}x{}, mapping is {}x{}",

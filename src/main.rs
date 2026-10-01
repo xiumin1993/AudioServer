@@ -11,14 +11,36 @@
 // 或 PCSPEAKER_CONSOLE=attach（从 cmd/PowerShell 里启动时挂到父控制台）。
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+// ── 初学者 3 分钟总览：这个界面是怎么画出来的 ──────────────────────────────
+// 整个文件是一套 egui 程序。egui 是"即时模式"（immediate mode）GUI 框架，
+// 和常见的"保留模式"（Win32 控件、Qt、WPF 那一类）根本区别在于：
+//   · 保留模式：控件是长期存在的对象，创建一次；数据变了调 setText() 局部刷新；
+//     框架只重画"脏了"的区域。
+//   · 即时模式：世界上没有"现成的控件"。每一帧都把界面从头描述一遍
+//     （本文件的 eframe::App::update() 就是每帧被调用的那段描述代码），
+//     egui 照着画一次就丢掉，下一帧再从头来。真正的"状态"只存在你自己的
+//     struct 字段里（AudioServerApp），界面每帧都是这些字段的一张"照片"。
+// 这解释了为什么本文件的代码都是"一连串 ui.label / ui.add 顺序往下写"——
+// 不是在"创建控件"，而是在"每帧重新描述"。eframe 是 egui 官方的窗口 +
+// 事件循环外壳；详细原理见文件末尾 `impl eframe::App` 上方那段总览。
 use eframe::egui;
 use log::{LevelFilter, Log, Metadata, Record};
 use std::cell::RefCell;
 use std::fs::OpenOptions;
 use std::io::Write;
+// std 同步通道：服务线程 → GUI 的"回灌"管线（ServerEvent）。
+// GUI 端只用 try_recv 非阻塞轮询（见 poll_server_events 的注释：界面线程绝不能等）。
 use std::sync::mpsc;
+// OnceLock = "只能写一次、之后反复读"的全局变量（首次用到时才初始化，线程安全）。
+// 本文件用它存日志文件路径和句柄；config.rs 用的是 OnceLock<Mutex<Config>> ——
+// 那种"多线程共享 + 每次读写加锁"的常规组合就是 Arc<Mutex<T>>/Mutex 家族，
+// 区别只是配置全局只有一份、不需要 Arc 引用计数。
 use std::sync::OnceLock;
 use std::time::Instant;
+// tokio 异步通道：GUI → 服务线程的"下命令"管线（ServerCommand）。
+// 和上面 std 版的分工：服务端在 async 运行时里用 .await 收命令，
+// 换成 std 通道会在队列空时把执行器卡死，所以异步侧必须用 tokio 的这套。
+// 一进一出两条通道 = GUI 线程和后台服务之间全部的沟通方式，双方不共享可变数据。
 use tokio::sync::mpsc as tokio_mpsc;
 
 use audioserver::config;
@@ -84,6 +106,10 @@ static LOG_LEVEL: std::sync::atomic::AtomicUsize =
 /// 全局 max_level（其它中间件读的是后者）。少调一处就会出现"界面显示已改成 debug，
 /// 日志却还是 info"这种最难查的假象。
 fn apply_log_level(level: LevelFilter) {
+    // Ordering::Relaxed 是原子操作附带的"内存序"标记，初学者可以这样记：
+    // 它规定这条读/写和其它数据之间要不要保持先后可见关系。日志级别只是
+    // "下一行日志按新值过滤"，不依赖任何配套数据，所以用最省 Relaxed。
+    // （常见档位：SeqCst 最严格通用、Acquire/Release 用于无锁结构成对同步。）
     use std::sync::atomic::Ordering::Relaxed;
     LOG_LEVEL.store(level as usize, Relaxed);
     log::set_max_level(level);
@@ -108,6 +134,10 @@ impl Log for DualLogger {
         if !self.enabled(record.metadata()) {
             return;
         }
+        // 格式化只拼一份：先 write! 进线程本地 BUF（thread_local + RefCell<Vec<u8>>，
+        // 每根线程一个、预留 512 字节免去小日志的反复扩容；Vec 当字符串缓冲区用，
+        // 比 String 好在可以 clear 后原地复用容量），然后同一块内存喂给两路输出。
+        // log::Record 没有现成的"一行文本"，级别/目标/文件名/正文要自己拼。
         BUF.with(|buf| {
             let mut b = buf.borrow_mut();
             b.clear();
@@ -138,6 +168,8 @@ impl Log for DualLogger {
         });
     }
 
+    // log crate 要求的"强制刷盘"接口。我们两路输出都是 write_all 直接落（stderr
+    // 行缓冲、文件靠 OS 页缓存），没有自己的缓冲池，所以这里合法地什么都不用做。
     fn flush(&self) {}
 }
 
@@ -220,6 +252,13 @@ fn install_panic_logger() {
 }
 
 // ── v2 浅色主题配色 ──
+// 想改整套观感，只该动这个模块里的常量：界面各处画笔几乎全部引用这里的
+// 名字（少数状态芯片例外，是内联的 from_rgb）。换主色调 → ACCENT 三件套；
+// 卡片/窗口底色 → BG_WHITE / BG_LIGHT；文字深浅层级 → TEXT_PRIMARY 到
+// TEXT_DISABLED 四档；输入框可见性 → INPUT_ 开头的五个（见下方说明）。
+// Color32::from_rgb(r, g, b)：三个参数各 0~255 的红绿蓝强度，
+// (255,255,255)=纯白、(0,0,0)=黑、(37,99,235)=本主题的蓝（tailwind blue-600）。
+// 另一套 from_rgba_premultiplied 多一个 alpha 通道（0 全透明 ~ 255 不透明）。
 mod colors {
     use eframe::egui::Color32;
 
@@ -354,6 +393,11 @@ fn main() -> eframe::Result<()> {
     let (locale, locale_from) = lang::apply_startup_locale();
     log::info!("[Main] UI language = {locale} (from {locale_from})");
 
+    // NativeOptions：建窗参数。inner_size [420.0, 540.0] 单位是"逻辑像素"
+    // （不是屏幕物理像素，高 DPI 屏上 egui/winit 会按缩放比例自动放大，
+    // 所以 420 在 2x 屏上实际占 840 个物理像素，界面元素也同比例放大）。
+    // 这个尺寸是按"竖着一列卡片"的原型调出来的；resizable(true) 允许用户拖大，
+    // 但设置页卡片很长，默认高度装不下 → 那一页自己套了滚动区（见 update 注释）。
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([420.0, 540.0])
@@ -364,14 +408,30 @@ fn main() -> eframe::Result<()> {
     // 英文 420px 宽够用，但中文标题更短、按钮更长，宽度先不随语言变（下一版再看）
     let window_title = lang::t("app.title");
 
+    // run_native 是"点火钥匙"：从这一行起创建窗口、进入 winit 操作系统事件循环，
+    // **它不返回，直到窗口关闭才带结果回来** —— main() 的执行顺序到此为止，
+    // 后面的错误日志要等退出才跑。参数里的 Box::new(|cc| ...) 是 App 工厂闭包：
+    // 启动时只调一次（cc = 创建上下文，带 egui_ctx），负责"一次性初始化"：
+    // 装中文字体、设主题 visuals、构造 AudioServerApp::new()；
+    // 之后事件循环每帧调用它的 update()。"new 一次 / update 每帧"就是
+    // App trait 的分工，也是即时模式"状态在我这、界面每帧重画"的落地形态。
     let result = eframe::run_native(
         &window_title,
         options,
         Box::new(|cc| {
             // 中文字体兜底（必须在设 visuals / 建界面之前）
+            // 为什么强调顺序：egui 在排版每一段文字时会按 FontDefinitions 找字形，
+            // 字体表必须在第一帧画文字前就位；而 set_fonts 和 set_visuals 互不依赖，
+            // 放一起纯粹是"一次把全局观感配完"的写法。
             install_cjk_fonts(&cc.egui_ctx);
 
             // 基于 egui 浅色主题，只覆盖需要的颜色
+            // Visuals::light() 是 egui 自带的一整套浅色配色"底版"；下面全是挑着改
+            // ——调色第二层入口在这里（第一层是 colors 模块的色板常量）：
+            // 那层定义"有哪些颜色"，这层决定"哪个部位用哪个颜色"。
+            // override_text_color = 全局默认文字色；widgets.* 按交互状态分组：
+            // noninteractive（不可交互）/ inactive（可交互未动）/ hovered（悬停）/
+            // active（按下/展开中）——update() 每帧按控件当前状态查这张表取色。
             let mut visuals = egui::Visuals::light();
             visuals.override_text_color = Some(colors::TEXT_PRIMARY);
             visuals.hyperlink_color = colors::ACCENT;
@@ -419,6 +479,8 @@ fn main() -> eframe::Result<()> {
 
             let app = AudioServerApp::new();
             // 门禁生效时标题栏也换成"需要准备驱动"，任务栏上一眼可辨
+            // send_viewport_cmd = egui 里"和窗口本身说话"的通道（改标题、关窗口、
+            // 改尺寸都走它），和画在客户区里的 ui 是两套出口，跨帧生效、不阻塞。
             if let Some(g) = app.env_gate.as_ref() {
                 cc.egui_ctx
                     .send_viewport_cmd(egui::ViewportCommand::Title(g.viewport_title()));
@@ -481,6 +543,11 @@ fn install_cjk_fonts(ctx: &egui::Context) {
             log::warn!("[Main] {path} does not look like a font file, skipping");
             continue;
         }
+        // egui 字体系统速览：FontDefinitions 是"字体族 → 字体清单"的总表，
+        // FontData::from_owned(字节) 把整个字体文件读进内存登记造册；
+        // families 里的 Proportional/Monospace 两条链按顺序找字形，内置字体
+        // 画不出来的字（汉字）才轮到 push 在链尾的系统字体顶上——这就是"兜底"。
+        // ctx.set_fonts 一次性替换全局字体表，所以必须赶在第一帧排版之前完成。
         let mut fonts = egui::FontDefinitions::default();
         fonts
             .font_data
@@ -553,6 +620,12 @@ struct AudioServerApp {
     buffer_size: String,
     connection_type: ConnectionType,
     server_status: ServerStatus,
+    // ── 与后台服务线程配合的三件套（即时模式下"线程怎么和界面说话"的答案）──
+    // · server_handle：服务 OS 线程的 JoinHandle（线程身份凭据）。本程序退出时
+    //   只发 Stop 命令让线程自行收尾、不 wait 等它（join 会把 GUI 卡住），所以只是拿着。
+    // · cmd_tx：GUI→服务 的命令发送端（tokio 无界通道，send 不阻塞；"无界"的代价
+    //   是没有背压，服务消费不过来只会排队 —— 换来的是界面永不被命令拖住）。
+    // · event_rx：服务→GUI 的事件接收端（std 通道，update() 里 try_recv 轮询取走）。
     server_handle: Option<std::thread::JoinHandle<()>>,
     cmd_tx: Option<tokio_mpsc::UnboundedSender<ServerCommand>>,
     event_rx: Option<mpsc::Receiver<ServerEvent>>,
@@ -642,6 +715,14 @@ impl AudioServerApp {
         // 界面上那几个输入框的初值来自 config.json（不是硬编码），
         // 这样"改配置文件 → 看界面 → 点开关"三处看到的永远是同一个数。
         // config::get() 只是读内存里那份全局配置（main 开头已经 init 过），不碰磁盘。
+        // 顺带把 config.json 的机制说清（详见 config.rs）：Config 及各小节 struct 都
+        // derive(Serialize, Deserialize)，serde 自动生成交互代码——读=JSON 文本变结构体，
+        // 写=结构体变 JSON 文本（to_string_pretty 带缩进，用户可用记事本直接改）。
+        // 文件在 %APPDATA%\PCAssistant\config.json，第一次运行自动生成默认版；
+        // 再老的版本用 exe 同目录 settings.txt（只有 language 一行），升级首启会被
+        // 搬进 config.json 一次。任何来源的值都要过 sanitize()：越界"夹紧"回合法区间
+        // （端口 0→8080、声道 5→2、缓冲区 100 万帧→8192…），每条夹紧都会以
+        // [Config] warning 写进日志留痕，界面上看到的就是实际生效的那个数。
         let cfg = config::get();
         let mut app = Self {
             port: cfg.network.port.to_string(),
@@ -756,10 +837,18 @@ impl AudioServerApp {
     fn poll_server_events(&mut self, ctx: &egui::Context) -> bool {
         let mut events = Vec::new();
         if let Some(rx) = &self.event_rx {
+            // 铁律：GUI 线程不能阻塞、不能长任务。即时模式的 update() 一帧不返回，
+            // 窗口就一帧不重绘、不响应鼠标 —— Windows 会给标题挂"未响应"。
+            // 所以这里用 try_recv（队列空立刻返回 Empty 就 break），绝不用会干等的 recv()。
+            // 每帧最多取 50 条：日志风暴时一帧也只消化这么多，剩余的下一帧再取；
+            // 只要这一帧取到过东西，update() 末尾就会 request_repaint()，不会有延迟堆积。
             for _ in 0..50 {
                 match rx.try_recv() {
                     Ok(event) => events.push(event),
                     Err(mpsc::TryRecvError::Empty) => break,
+                    // Disconnected = 发送端（服务线程）已经消失：要么服务自己退出了，
+                    // 要么 run_server 返回/崩了。这里把它翻译成"停止运行"的界面状态，
+                    // 并把两条通道句柄清掉（cmd_tx=None 后 send_cmd 自动变空操作）。
                     Err(mpsc::TryRecvError::Disconnected) => {
                         self.server_status = ServerStatus::Stopped;
                         self.cmd_tx = None;
@@ -779,6 +868,10 @@ impl AudioServerApp {
         got_any
     }
 
+    // 事件回灌界面的唯一入口：每个 ServerEvent 变体在这里翻译成"改掉某个 self 字段"，
+    // 全程不画任何东西——下一帧 update() 重新描述界面时自然读到新值。
+    // 即时模式完整数据闭环：后台线程 send 事件 → GUI try_recv → 改字段 → 请求重绘。
+    // ctx 参数只为 CamFrame 解码上传纹理用（load_texture 要摸渲染上下文）。
     fn handle_event(&mut self, event: ServerEvent, ctx: &egui::Context) {
         match event {
             ServerEvent::Log(msg) => self.add_log(msg),
@@ -800,6 +893,12 @@ impl AudioServerApp {
             // ── v3 麦克风事件 ──
             ServerEvent::MicLevel(level) => {
                 // 滚动电平：左移一格，右侧写入新值（×3 感知增益后截断）
+                // 展开说：mic_bars 是定长 34 的数组，当"没有环的环形缓冲"用 ——
+                // rotate_left(1) 把最老的值甩到队尾，再往最后一格写最新值，
+                // 画出来就是"左旧右新"的滚动波形。34 这个数字 = 界面电平条最多
+                // 画 34 根（show_level_bars 按可用宽度取尾部若干根）。
+                // ×3.0 是感知增益：静音环境原始电平太小，曲线贴着底看不出动静；
+                // .min(1.0) 把它截到 100%，爆表也不会画出去。
                 self.mic_bars.rotate_left(1);
                 self.mic_bars[self.mic_bars.len() - 1] = (level * 3.0).min(1.0);
             }
@@ -887,6 +986,9 @@ impl AudioServerApp {
     }
 
     /// 向服务器线程发命令（服务器未运行时忽略）
+    // 实现细节：unbounded 通道 send 永不阻塞、只可能因对方已退出而报错；
+    // .ok() 是【故意】把 Err 丢掉——服务都停了，命令没人收正是预期行为，
+    // 不该为它在界面线程上做任何错误处理。
     fn send_cmd(&self, cmd: ServerCommand) {
         if let Some(tx) = &self.cmd_tx {
             tx.send(cmd).ok();
@@ -1098,6 +1200,10 @@ impl AudioServerApp {
                 v.widgets.open.weak_bg_fill = colors::ACCENT_BG;
                 v.widgets.open.bg_stroke = egui::Stroke::new(1.5_f32, colors::ACCENT);
             }
+            // from_id_salt(key)：用字符串显式钉死这个 ComboBox 的 Id（salt=哈希加料）。
+            // "展开/收起"状态存在 egui 的内存库里、钥匙就是 Id：不给的话默认按
+            // "调用处 ui 树位置"推导，页面布局稍变状态就会串位——key 是稳定的配置字段名，
+            // 正好一钥对一框。
             egui::ComboBox::from_id_salt(key)
                 .selected_text(egui::RichText::new(selected_label).size(13.0))
                 // 按钮和弹出列表同宽：120px 装得下 "192000 Hz"；设备下拉另外占满整行
@@ -1273,6 +1379,11 @@ impl AudioServerApp {
     }
 
     fn add_log(&mut self, msg: String) {
+        // 这是"日志页显示用的尾部缓存"，和写到磁盘的完整 audioserver.log 是两回事
+        // （后者一行不落；这里只留最近 200 条给界面看，找全量去设置页印的路径）。
+        // 超限不是逐条挤掉，而是一次删最旧的 50 条（drain 会 memmove 整个 Vec，
+        // 攒批删摊薄成本）；200 也顺便封顶了 Log Tab 每帧要绘制的 label 数量——
+        // 即时模式里"列表多长=每帧画多少个 galley"，上限就是性能阀门。
         let timestamp = chrono_now();
         self.logs.push(format!("[{}] {}", timestamp, msg));
         if self.logs.len() > 200 {
@@ -1281,15 +1392,38 @@ impl AudioServerApp {
     }
 
     fn start_server(&mut self) {
+        // 已经在跑就直接返回：这个函数由 Toggle/门禁撤除两处调用，防重入比信任调用方可靠。
         if self.server_status == ServerStatus::Running {
             return;
         }
+        // ── 四个默认魔数（界面字符串 parse 失败时的兜底值）──
+        // · 8080：WebSocket 服务端口。config.rs 默认配置同样是 8080，手机 App 里写死
+        //   连这个；改这里不影响 config.json（它只是"输入框里打的全不是数字"时兜底），
+        //   真要换端口去设置页/配置文件改，两边不一致时手机会连不上。
+        // · 48000：采样率 48kHz，Windows WASAPI 混音格式和视频行业的标准档；
+        //   44100 是 CD 档。改低省带宽音质差，改高带宽翻倍（手机端要同步改才连贯）。
+        // · 2：声道数，2=立体声/1=单声道；config.rs 的 clamp 只放行 1 或 2，写 3 也回 2。
+        // · 1024：捕获缓冲（单位=帧，不是毫秒！48kHz 下 1024 帧 ≈ 21ms）。调小延迟低
+        //   但容易爆音，调大稳但声音发闷（config.rs 夹在 128~8192 帧之间）。
+        // ⚠ 注意（server.rs 里已有人用 ⚠ 标注，这里只转述、不改代码）：server.rs 把
+        //   缓冲换算成 WASAPI 的"100 纳秒时长"时写的是 采样率 × 10_000，注释说意图是
+        //   10ms——但 10ms 应是 100_000 个 100ns（×100 才对得上）。按现在的公式
+        //   48000×10000 = 4.8 亿个 100ns = 48 秒，量纲疑似写错。那是硬件侧的事，
+        //   本文件一行不动；排查缓冲行为时先看 server.rs 那一处。
         let config = ServerConfig {
             port: self.port.parse().unwrap_or(8080),
             sample_rate: self.sample_rate.parse().unwrap_or(48000),
             channels: self.channels.parse().unwrap_or(2),
             buffer_size: self.buffer_size.parse().unwrap_or(1024),
         };
+        // 两条通道各方向一条（对照文件头 import 处的说明）：
+        // · std mpsc::channel()：服务线程往里 send(ServerEvent)，GUI 每帧 try_recv 取走。
+        //   std 版收端是同步 API，正合"在 update 里顺手 poll 一把"的用法。
+        // · tokio_mpsc::unbounded_channel()：GUI 往里 send(ServerCommand)，服务在
+        //   async 循环里 .await 收。异步侧必须用 tokio 版：std 接收端 await 不了，
+        //   换成阻塞 recv() 会把单线程执行器整个卡死。
+        // "unbounded"=队列无上限：send 永不失败永不等待（GUI 不被后台拖住），
+        // 代价是没有背压——命令发疯了一样只会排队。本程序命令量级完全够用。
         let (event_tx, event_rx) = mpsc::channel();
         let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel();
         self.event_rx = Some(event_rx);
@@ -1297,6 +1431,16 @@ impl AudioServerApp {
         self.client_count = 0;
         self.logs.clear();
         self.start_time = Some(Instant::now());
+        // 服务跑在【独立 OS 线程】：GUI 这边 spawn 完立刻返回继续画界面——
+        // 绝不在 update 里干等，这正是"界面不能阻塞"的落地方式。
+        // move ||：把 config / event_tx / cmd_rx 的所有权整体搬进新线程
+        // （Rust 跨线程只能搬所有权或共享不可变数据，编译期就杜绝了数据竞争）。
+        // 线程内部：Runtime::new() 建一个单线程 tokio 异步执行器，
+        // rt.block_on(run_server(..)) 让 async 的服务主循环成为这个线程的"全部工作"
+        // （收命令、连手机、推流都在这一台小事件循环里并发）。
+        // 这里的 unwrap 若炸（建不起运行时）：panic 钩子会记进日志（见 install_panic_logger），
+        // event_tx 随线程销毁 → GUI 下一次 try_recv 得到 Disconnected → 状态回落 Stopped，
+        // 和 poll_server_events 里的处理正好闭环。
         let handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(run_server(config, event_tx, cmd_rx));
@@ -1317,12 +1461,19 @@ impl AudioServerApp {
         self.add_log("Stop command sent".to_string());
     }
 
+    // 本机 IPv4：问系统路由表"默认网卡是哪块"，不发包、纯本地查询，所以每帧
+    // 现取也便宜。断网/多网卡选错时返回 "Unknown"，界面上的地址跟着变——
+    // 手机要连的就是这里显示的那台机器，值不值对得上，现场一眼就能核。
     fn get_local_ip() -> String {
         local_ip_address::local_ip()
             .map(|ip| ip.to_string())
             .unwrap_or_else(|_| "Unknown".to_string())
     }
 
+    // 运行时长：Instant 是"单调时钟的一个时间点"（不受系统改表影响），
+    // elapsed() 拿到"从那个点到现在的时长"，取总秒数后拆 时/分/秒。
+    // 没人重绘就不刷新——update() 末尾那条 1000ms 心跳就是专门喂它的，
+    // 所以完全空闲时秒数最多慢一秒，肉眼无感，CPU 却省了 96%+。
     fn uptime_str(&self) -> String {
         match self.start_time {
             Some(start) => {
@@ -1345,8 +1496,25 @@ impl AudioServerApp {
 
     // ── Header：状态 + 开关 ──
     fn show_header(&mut self, ui: &mut egui::Ui, is_running: bool) {
+        // 布局容器第一课：ui.horizontal(|ui| {...}) = "这一段的东西排成一行"，
+        // 从左往右逐个领宽度；Ui 的默认方向本来就是竖排（往下堆），
+        // ui.vertical() 只是显式包一层。同类还有：ui.columns(n, ...) 横切 n 等份
+        // 各放一个 ui；egui::Grid 跨行对齐列（见 show_settings_tab 里 Grid 的注释——有坑）；
+        // ui.with_layout(Layout::right_to_left(..)) 反过来从右往左排，专做"标签靠左、控件靠右"。
+        // ui.allocate_exact_size 是"手绘控件三件套"的第一步（本文件到处是这个模式）：
+        // ① allocate：在当前布局位置占住一块 Rect，返回 (Rect, Response)。
+        //    Response 是这一帧交互的"回执"：clicked()/hovered()/changed() 只在当事那帧为真；
+        //    Sense 声明这块区域感知什么——Sense::hover() 只跟鼠标，Sense::click() 认点击，
+        //    Sense::drag() 管拖拽。兄弟 API ui.allocate_rect(自己算好的 Rect, sense) 用于
+        //    手动摆位；ui.put(rect, widget) 是"把现成控件塞进指定矩形"（本文件全走
+        //    自动布局 + allocate，没用 put，但读其它 egui 代码时一定会遇到）。
+        // ② 查 Response：这一帧用户碰了它没有。
+        // ③ if ui.is_rect_visible(rect) 再 ui.painter() 画：滚出可视区就跳过绘画但照常占位，
+        //    布局不会忽闪。Toggle、模式胶囊、Tab、芯片全是这套骨架，学会一处全懂。
         ui.horizontal(|ui| {
             // 小圆点状态指示器
+            // 12.0 = 逻辑像素直径，纯观感值；改大会顶高整行 Header。
+            // 它只需要"看起来是个点"，不吃交互，所以 Sense::hover()、Response 用 _ 丢掉。
             let dot_size = 12.0_f32;
             let (dot_rect, _) = ui.allocate_exact_size(
                 egui::vec2(dot_size, dot_size),
@@ -1365,6 +1533,18 @@ impl AudioServerApp {
             ui.add_space(10.0);
 
             // 状态文字（v3：随模式变化；v3.6：全部走 i18n）
+            // ── i18n 三件事，初学者必知 ──
+            // ① 文案本体在仓库根的 locales/en.toml、locales/zh.toml；lib.rs 里的
+            //    `i18n!("locales", fallback = "en")` 宏在【编译期】把它们展开进二进制，
+            //    所以发行包是单 exe、运行时没有语言文件。
+            // ② 因此改了 toml 必须重新编译才看得到变化。Cargo 默认只盯 .rs 文件，
+            //    build.rs 用 cargo:rerun-if-changed 逐个登记 locales/*.toml 才救回这条
+            //    （2026-10-01 就翻过车：改了 toml 没重编 lib，界面直接印键名原文）。
+            // ③ 运行时 lang::t("键")/lang::tf("键", 占位表) 从 rust-i18n 的内存状态取句子，
+            //    不碰磁盘；切语言只改内存 + 写 config.json。正因为 egui 每帧重新执行
+            //    这些 t() 调用，"换语言"不需要重建任何控件——下一帧全站自动是新文案。
+            //    缺键时 rust-i18n 回退英文，再缺就原样显示键名（界面上看到 "settings.xxx"
+            //    这种字样 = 缺键，不是显示坏了）。
             ui.vertical(|ui| {
                 let title = if !is_running {
                     lang::t("header.stopped")
@@ -1390,6 +1570,12 @@ impl AudioServerApp {
                 } else {
                     lang::t("header.running")
                 };
+                // 文字表现两套写法：ui.label("纯文本") 走默认样式（TextStyle::Body，
+                // 字号可由用户全局设定）；egui::RichText::new(...) 是带样式的链式构造器——
+                // .size(px) 覆盖字号（15 主标题 / 13 正文 / 11 提示 / 10 脚注是本页的节奏）、
+                // .strong() 加粗、.monospace() 换等宽字体族、.color() 覆盖颜色。
+                // 内部对应关系：size→FontId、monospace→FontFamily::Monospace、
+                // strong→FontId 的粗体变体；RichText 只是把 TextStyle 显式化的快捷方式。
                 ui.label(
                     egui::RichText::new(title)
                         .size(15.0)
@@ -1426,6 +1612,12 @@ impl AudioServerApp {
             });
 
             // Toggle 开关
+            // with_layout(right_to_left)：这一行从窗口右缘往左摆 —— 开关永远贴右上角，
+            // 中间的标题文字占剩余空间。尺寸魔数一组的含义：44x24 = 轨道的宽/高（逻辑像素，
+            // 模仿 iOS 开关比例）；knob_r=10 旋钮半径；旋钮圆心距轨道端 12 = knob_r(10)+2，
+            // 上下也各留 2px 缝（(24-20)/2）。这四个数互相咬合，只改一个会"旋钮戳出轨道"。
+            // Sense::click()：这块矩形认点击，clicked() 那帧直接调 start/stop_server——
+            // 即时模式的"事件处理"就是当场问回执、当场改状态，没有回调注册。
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let toggle_w = 44.0_f32;
                 let toggle_h = 24.0_f32;
@@ -1481,6 +1673,9 @@ impl AudioServerApp {
     }
 
     // ── v3：模式切换条（Speaker / Microphone 两个胶囊按钮） ──
+    // 骨架和 Header 的 Toggle 一样：allocate → 查回执 → 画（见 show_header 的三件套注释）。
+    // 新东西只有宽度算式：btn_w = (本行剩余宽度 - 间隙) ÷ 按钮数 —— 先问
+    // ui.available_width()（即时模式里"还剩多少地方"是每帧现算的），等分后窗口变宽变窄都自适应。
     fn show_mode_switch(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.set_height(34.0);
@@ -1516,6 +1711,12 @@ impl AudioServerApp {
                         bg,
                         egui::Stroke::new(1.0_f32, border),
                     );
+                    // 排版与绘制是两步：layout_no_wrap 把字符串排成 galley
+                    // （"排好版的一块文字"，可查询宽高），painter().galley() 再把它画上去。
+                    // FontId::proportional(12.0) = "比例字体、字号 12"（比例=不同字符宽度不同，
+                    // 相对的是 monospace 等宽）。选中档 12.5 比未选中 12.0 只大半号，
+                    // 纯粹为了"重一点"的观感，没有任何数值含义。
+                    // text_pos = 矩形中心 − 文字半宽/半高，就是"水平+垂直居中"的通用公式。
                     let galley = ui.fonts(|f| {
                         f.layout_no_wrap(
                             label.to_string(),
@@ -1537,6 +1738,10 @@ impl AudioServerApp {
     }
 
     // ── v3：上行电平滚动条（复刻原型里的动画电平条） ──
+    // 尺寸魔数：bar_w=7 一根条的宽、gap=3 条间距、max_h=44 满值时的高度（都是逻辑像素）。
+    // n = 可用宽度里塞得下几根就画几根（(宽+间距)/(条宽+间距) 向下取整），上限 34 根——
+    // 正好是 mic_bars 数组长度（handle_event 里维护的"左旧右新"滚动历史）。
+    // 数据来自 MicLevel 事件（约 20Hz 一条），这也是 update() 末尾"有事件就立刻重绘"的原因之一。
     fn show_level_bars(&self, ui: &mut egui::Ui) {
         let bar_w = 7.0_f32;
         let gap = 3.0_f32;
@@ -1569,6 +1774,9 @@ impl AudioServerApp {
     }
 
     // ── v3：小圆角状态徽章（手绘：0.29 的 Label 无 fill） ──
+    // 又一个小控件范本：先 layout 量出文字尺寸，再加 pad_x/pad_y（8/3 逻辑像素）
+    // 算出总大小交给 allocate，最后 rect_filled 画胶囊底 + galley 叠文字。
+    // "egui 内置控件没有现成样式时怎么办"的标准答案就是：照这个套路自己画一个。
     fn show_chip(ui: &mut egui::Ui, text: &str, fg: egui::Color32, bg: egui::Color32) {
         let galley = ui.fonts(|f| {
             f.layout_no_wrap(text.to_string(), egui::FontId::proportional(10.0), fg)
@@ -1586,6 +1794,9 @@ impl AudioServerApp {
     }
 
     // ── Tab 栏 ──
+    // 同样是 allocate→回执→绘制三件套；tab_width = 行宽 ÷ 3 等分，38.0/底部 2px 蓝线是观感值。
+    // "当前选中的是哪个 Tab"不存在控件里，而是 self.active_tab 字段——即时模式的选中态
+    // 永远自己维护：每帧拿字段和这张 Tab 比对来决定高亮，点击那帧只负责改字段。
     fn show_tabs(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.set_height(38.0);
@@ -1645,6 +1856,8 @@ impl AudioServerApp {
     // ── Footer ──
     fn show_footer(&self, ui: &mut egui::Ui, is_running: bool) {
         ui.horizontal(|ui| {
+            // env!("CARGO_PKG_VERSION")：编译期把 Cargo.toml 的 version 字段直接嵌进
+            // 二进制成字符串字面量——发新版本号，页脚自动跟着变，不用改这里的代码。
             ui.label(
                 egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
                     .size(10.0)
@@ -1684,6 +1897,8 @@ impl AudioServerApp {
                         .color(colors::TEXT_DISABLED),
                 );
                 ui.add_space(6.0);
+                // 页脚状态小圆点：6px（Header 那朵是 12px——同一语言的小尺寸版），
+                // 同样 allocate(Sense::hover) + circle_filled 两步，纯装饰不吃点击。
                 let dot_size = 6.0_f32;
                 let (rect, _) = ui.allocate_exact_size(
                     egui::vec2(dot_size, dot_size),
@@ -1717,6 +1932,10 @@ impl AudioServerApp {
         let local_ip = Self::get_local_ip();
 
         // 连接方式按钮行
+        // 第三个元素 = 该方式现在能不能点（WiFi=true；USB/蓝牙 是画出来占位的禁用态：
+        // Sense::hover() 只挂鼠标不挂点击，灰字提示"以后这里有"。加新方式时把 true 打开即可）。
+        // 行高 56、按钮 52、圆角 8、间隙 8 全是指定像素的观感值，窗口窄时 btn_w 由
+        // (行宽 - 2×gap)/3 自适应，数字本身没有物理含义。
         ui.horizontal(|ui| {
             ui.set_height(56.0);
             let conns = [
@@ -1781,6 +2000,15 @@ impl AudioServerApp {
         ui.add_space(4.0);
 
         // 连接信息卡片
+        // ── "卡片"模式（全文件重复十几次的那段配方）──
+        // egui::Frame::none() 是"什么装饰都没有的画框起点"，链式点上四样：
+        //   .fill 底色（BG_WHITE 纯白卡片）· .stroke 边框（1px 浅灰 BORDER）
+        //   .rounding(8.0) 圆角半径（逻辑像素）· .inner_margin(14.0) 内边距。
+        // 然后 card_frame.show(ui, |ui| {...}) 在父布局里开出这块带底色的区域，
+        // 闭包内的 ui 就是"框内剩余空间"，继续 horizontal/label 照常排。
+        // 想统一改圆角/留白，搜 `Frame::none()` 批量对齐即可；
+        // 页面真正的"骨架分区"（顶栏/内容/底栏）则由 update() 里的 Panel 负责，
+        // Frame 只管"一块带背景的矩形"这一层。
         let card_frame = egui::Frame::none()
             .fill(colors::BG_WHITE)
             .stroke(egui::Stroke::new(1.0_f32, colors::BORDER))
@@ -1816,6 +2044,10 @@ impl AudioServerApp {
                         )
                         .clicked()
                     {
+                        // ui.output_mut = 这一帧结束时把 copied_text 交给系统剪贴板，
+                        // 是 egui"界面向外发东西"的官方出口（cursor_icon 也走这条路）。
+                        // 顺带对比：内置 Button 不需要手绘三件套——ui.add(控件) 自己
+                        //  allocate、自己画外观、返回 Response，链上 .clicked() 当场消费。
                         ui.output_mut(|o| o.copied_text = local_ip.clone());
                     }
                     ui.add_space(6.0);
@@ -1833,6 +2065,9 @@ impl AudioServerApp {
             ui.add_space(6.0);
 
             // WebSocket 地址
+            // 拼的是手机 App 实际连的端点：端口 = 界面当前值（默认 8080），路径 /ws/audio
+            // 由 server.rs 的路由决定（改这里不改服务端 = 展示错方向，两边要一起动）。
+            // 每帧现拼：port 是内存字段、local_ip 也是这一帧现问操作系统的，无需缓存。
             let ws_addr = format!("ws://{}:{}/ws/audio", local_ip, self.port);
             ui.horizontal(|ui| {
                 ui.label(
@@ -2059,6 +2294,10 @@ impl AudioServerApp {
                                     egui::Sense::hover(),
                                 );
                                 if ui.is_rect_visible(rect) {
+                                    // 红点"呼吸"动画：0.6 + 0.4×sin(运行秒数×4) 在 0.2~1.0 摆动，
+                                    // ×4 决定频率（一个来回约 1.6 秒）；linear_multiply(pulse)
+                                    // 按系数压暗红色。每帧重画时用的是当帧新值 —— 即时模式做动画
+                                    // 不需要定时器控件，只要"每帧算一次 + 有人肯重绘"（250ms 心跳，见 update 末尾）。
                                     let pulse =
                                         (0.6 + 0.4 * (self.uptime_f64() * 4.0).sin()) as f32;
                                     ui.painter().circle_filled(
@@ -2260,6 +2499,12 @@ impl AudioServerApp {
                     .color(colors::TEXT_MUTED),
             );
             ui.add_space(6.0);
+            // 预览区：宽 = 卡片内剩余宽度，高按图片真实比例反推
+            // h = preview_w × 图高/图宽（.max(1) 防除零）——等比缩放，永远不拉伸变形。
+            // tex 是 TextureHandle：CamFrame 事件（1fps）把 JPEG 解码后经
+            // ctx.load_texture 上传给渲染器；egui 的内置 Image 控件直接贴它。
+            // 没帧时的占位同样占 preview_w × 3/4 高（4:3 = 手机主摄常见比例），
+            // 黑位换成有图都不会引起卡片跳动。
             let preview_w = ui.available_width();
             match &self.cam_texture {
                 Some(tex) => {
@@ -2403,7 +2648,12 @@ impl AudioServerApp {
             ui.add_space(8.0);
             // 服务在跑 = 两个共享内存通道已经按当前尺寸建好了，中途改尺寸会让
             // 已经打开摄像头的软件拿到错乱的帧 —— 和音频参数一样锁起来。
+            // ui.add_enabled_ui(false, ...)：把整棵子树设为"禁用"——控件照常绘制
+            // 但改变 sense 不再吃输入、配色走 noninteractive 那组（所以 INPUT_BG_DISABLED
+            // 那套专门做得"看得见但改不动"）。这是 egui 锁表单的最省写法，不用逐控件 add_enabled。
             ui.add_enabled_ui(!is_running, |ui| {
+                // Grid 用法 / "TextEdit 边框被 Grid 吞掉要靠 ui.scope 修"的大坑，
+                // 详解见后面 egui::Grid::new("audio_settings") 上方的长注释，此处不再重复。
                 egui::Grid::new("camera_output_settings")
                     .num_columns(2)
                     .spacing([8.0, 6.0])
@@ -2783,6 +3033,25 @@ impl AudioServerApp {
             );
             ui.add_space(8.0);
             ui.add_enabled_ui(!is_running, |ui| {
+                // ── egui::Grid 用法与它的大坑（这段务必读完再动下面任何一行）──
+                // Grid = 跨行对齐的表格布局：num_columns(2) 声明两列，第一列全部
+                // 左对齐、第二列全部对齐到同一竖线（普通 horizontal 每行各排各的，
+                // 做不到"每列同宽"，这就是设置页用 Grid 的原因）。spacing([8.0, 6.0])
+                // = [列间距, 行间距]（逻辑像素）；ui.end_row() 说"本行完，换下一行"。
+                // Grid::new("audio_settings") 的字符串是这个 Grid 的 Id（见 update()
+                // 上方总览：Id 是 egui 存控件内部状态的钥匙，改名等于换钥匙，
+                // 内部布局状态作废重来——别随手重命名这些字符串）。
+                // ⚠ 大坑（2026-10-01 专门提交修过，别图省事退回去）：
+                // TextEdit/ComboBox 画背景和边框用的是"先占位、后回填"——show() 先往
+                // 本次布局的 shape 列表塞一个 Noop 占位记住下标，收尾时 painter().set(下标, 矩形)
+                // 把底色/边框插回那个位置。而 Grid 为了对齐会把单元格里的 shape 列表
+                // 【重排/搬移】，占位下标就错位失效，结果是"Grid 里的输入框永远画不出边框"
+                // ——实测：停止服务后 48000/2/1024 三行白字贴白卡，一个框都没有。
+                // 修法不是改 Grid，而是给每个输入控件包一层 ui.scope（见 config_text_edit /
+                // dropdown_at_width）：scope 会开出子 Ui，子 Ui 有【自己的 shape 列表】，
+                // 占位下标落在里面，父级 Grid 无论怎么搬动整段都不会踩到下标。
+                // 所以 Grid 单元里调的是 Self::config_text_edit / Self::config_dropdown，
+                // 而不是裸 ui.add(TextEdit) —— 看着绕，其实是必需的。
                 egui::Grid::new("audio_settings")
                     .num_columns(2)
                     .spacing([8.0, 6.0])
@@ -2922,6 +3191,7 @@ impl AudioServerApp {
             );
             ui.add_space(8.0);
             ui.add_enabled_ui(!is_running, |ui| {
+                // Grid + 端口输入框：ui.scope 防吞边框的原理见 "audio_settings" 上方注释。
                 egui::Grid::new("net_settings")
                     .num_columns(2)
                     .spacing([8.0, 6.0])
@@ -3102,6 +3372,9 @@ impl AudioServerApp {
         // 这一张是【电脑往虚拟声卡里灌】时用的是什么格式 —— 两者可以不一样：
         // 手机推 48k 单声道，电脑按 CABLE 的混音格式（一般 48k 立体声）灌进去。
         let rate_options = number_options(&["44100", "48000", "96000", "192000"], " Hz");
+        // 抖动缓冲上限档位（毫秒，config.rs 夹 20~2000）：网络抖动比这还大就丢帧保实时。
+        // 100 激进（卡网直接断音）、600 保守（ worst case 半秒延迟像对讲机）——
+        // 档位就是"实时性 vs 流畅度"的五个刻度，不是随便五个数。
         let queue_options = number_options(&["100", "150", "250", "400", "600"], " ms");
         let card3 = egui::Frame::none()
             .fill(colors::BG_WHITE)
@@ -3117,6 +3390,7 @@ impl AudioServerApp {
             ui.add_space(8.0);
             // 注入流已经按当前格式开着了，中途换采样率/缓冲等于抽掉地基 —— 锁
             ui.add_enabled_ui(!is_running, |ui| {
+                // Grid + ui.scope 防吞边框的原理：见 egui::Grid::new("audio_settings") 上方长注释
                 egui::Grid::new("mic_inject_settings")
                     .num_columns(2)
                     .spacing([8.0, 6.0])
@@ -3279,6 +3553,10 @@ impl AudioServerApp {
             .rounding(6.0)
             .inner_margin(egui::Margin::same(10.0));
 
+        // ScrollArea = "内容超出可视区就出滚动条"的容器：vertical = 只允许上下滚。
+        // max_height 由可用高度现算（即时模式里 UI 尺寸是这一帧问这一帧的，-4 是留边）；
+        // stick_to_bottom = 新日志追加进来时自动滚到最底看最新一行（终端的经典行为）。
+        // 它和设置页那个不设上限的 ScrollArea 用法互补：那边装长表单，这边装无限增长的列表。
         let available_height = ui.available_height() - 4.0;
         log_frame.show(ui, |ui| {
             egui::ScrollArea::vertical()
@@ -3318,8 +3596,30 @@ impl AudioServerApp {
     }
 }
 
+// ── eframe::App：即时模式的主场景，update() 每一帧都会被重新调用 ──────────
+// 什么时候被调？三种触发源：① winit 送来输入事件（鼠标移动/点击/键盘/窗口缩放/
+// 重获焦点），egui 自动安排一帧；② 代码主动 ctx.request_repaint()（尽快画下一帧）；
+// ③ ctx.request_repaint_after(d)（最迟 d 之后必须画一帧）。没有第四种——
+// 什么都没发生、也没挂心跳时，一帧都不会画。这就是"按需重绘"省 CPU 的原理：
+// 原来这里是【无条件】request_repaint()，等于每帧都说"立刻再来一帧"，
+// 窗口以能跑多快跑多快的频率永久空转（实测烧掉约 1.15 个核心，任务管理器 14~16%；
+// 改成"有事件才快绘、没事挂 250ms/1000ms 心跳"后降到 ~0.4%）。音频/视频搬运
+// 在后台线程，GUI 只是"照片"，空转重绘画出的照片一模一样，纯属白烧。
+// 每次进入 update，egui 从零开始重建整个界面：先按声明顺序切窗口矩形
+// （TopBottomPanel 逐条收边走，CentralPanel 拿剩余），再在每块里摆控件、
+// 比对输入、发 Response。所以：
+//   · 不能把"只执行一次"的逻辑写在 update 里（该去 App::new / main 头部）；
+//   · 状态改动（点开关、收事件）都写回 self 字段，下一帧的描述自然读到新值；
+//   · 控件的"内部记忆"（悬停、聚焦、滚动条位置、下拉开合）由 egui 按 Id 存在
+//     ctx 内存库里，Id 来自 ui 树调用位置或 Grid::new("名字")/from_id_salt 显式指定——
+//     这就是 id/Id 与 widget 状态持久化的关系：钥匙稳，记忆才稳。
+// 顺带对照保留模式：那边"改数据→控件自己刷新"；这边"改数据→等下一帧整体重描述"，
+// 两套心智模型，混着写必翻车。
 impl eframe::App for AudioServerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 入参速记：ctx = 整窗上下文（重绘请求/内存库/字体都在它身上，调任何
+        // request_repaint 都走它）；_frame = eframe 的窗口帧句柄（本程序没用到，
+        // 下划线开头表示"参数在但我不读"）；&mut self = 那个装着全部界面状态的 App。
         // ── v3.5 环境门禁：必需驱动没齐时，整页只显示向导 ──
         // 这里【不 poll_server_events、不画主界面、不起服务端】——
         // 用户看到的就是"程序还没开始工作"，避免连上手机才发现没设备。
@@ -3359,6 +3659,17 @@ impl eframe::App for AudioServerApp {
         let had_events = self.poll_server_events(ctx);
         let is_running = self.server_status == ServerStatus::Running;
 
+        // ── 布局系统第二课：Panel / Frame / Area / Window 各管什么 ──
+        // egui 的"分区"工具按用途分四档：
+        //   · TopBottomPanel::top/bottom —— 从窗口上/下缘切走一条固定高度的横带；
+        //     同名不同 id 的多个 top 按【声明顺序】从上往下叠（下面正好三条 top）。
+        //   · SidePanel::left/right —— 左右竖带；本窗口窄（420 逻辑像素）用不上，原理同 top。
+        //   · CentralPanel —— "剩下的全给我"：所有边缘带瓜分后剩余的中央矩形。
+        //   · Frame —— 不是分区，是"带背景/边框/圆角/内边距的一块画布"，卡片全靠它（见卡片注释）。
+        //   · Area / Window —— 浮动层：Area 无框随处漂（ComboBox 的弹出菜单就是 Area），
+        //     Window 是带标题可拖动的浮动小窗；本程序没有用它们，加弹窗时再找。
+        // 顺序铁律：top/bottom 写在 CentralPanel【之前】。egui 按代码顺序切矩形，
+        // 反过来 CentralPanel 先拿走整窗，后声明的边带就没地可站了。
         // 顶部面板：Header
         egui::TopBottomPanel::top("header_panel")
             .frame(
@@ -3411,6 +3722,10 @@ impl eframe::App for AudioServerApp {
                     .inner_margin(egui::Margin::same(16.0)),
             )
             .show(ctx, |ui| {
+                // Spacing = "同一容器里相邻控件之间留多少缝"，item_spacing 是 vec2(横向, 纵向)。
+                // spacing_mut() 改的只是这个面板这一棵子树（即时模式改样式不外溢），
+                // 影响之后创建的所有自动布局控件。想手动插一段空：ui.add_space(8.0) 一次性
+                // 顶出固定高度；ui.separator() 则画一条浅灰横线并自带间距（连接卡片里在用）。
                 ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
                 match self.active_tab {
                     AppTab::Connection => self.show_connection_tab(ui),
@@ -3444,6 +3759,10 @@ impl eframe::App for AudioServerApp {
         // 这些交互由 winit 输入事件和 egui 自己的动画机制触发重绘，
         // 与本条心跳无关。门禁页早就是这套写法（见上面 env_gate 分支），
         // 主界面是漏改的那一处。
+        // 把上面三条翻译成 API：request_repaint()="画完这帧尽快画下一帧"，
+        // request_repaint_after(d)="最迟 d 之后必画一帧"；两者排队不叠加，
+        // 一帧里调一百次也只排一帧。窗口最小化时 eframe 自动停掉所有重绘，
+        // 这也是按需模式白赚的一档（满帧循环时代最小化照烧 CPU）。
         if had_events {
             ctx.request_repaint();
         } else {
@@ -3453,6 +3772,10 @@ impl eframe::App for AudioServerApp {
         }
     }
 
+    // 窗口关闭时的最后回调（App trait 的第二个钩子，整个生命周期只跑一次——
+    // 对比 update 的"每帧一次"）。往命令通道塞一条 Stop 让服务线程自行收尾；
+    // stop_server 不 join 等线程死透，关窗流程绝不在这段时间卡住。
+    // 参数 _gl = 底层 OpenGL 上下文（需要手动释放 GPU 资源才用得到，我们没有）。
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if self.server_status == ServerStatus::Running {
             self.stop_server();
@@ -3524,6 +3847,11 @@ fn decode_jpeg_to_texture(ctx: &egui::Context, jpeg: &[u8]) -> Option<egui::Text
     Some(ctx.load_texture("cam_frame", image, egui::TextureOptions::LINEAR))
 }
 
+// 日志页时间戳：手写 HH:MM:SS，不用 chrono 库——只为一个秒针不值得多一个依赖。
+// 算法：取 Unix 纪元（1970-01-01 UTC 零点）到现在的总秒数，%86400（一天=24h×3600s）
+// 得"今天第几秒"，再拆成时/分/秒。
+// ⚠ 注意：这条链全程是 UTC，没有换算本地时区——日志页时间可能比你手表慢/快几个钟头。
+// 只影响界面显示，磁盘 audioserver.log 的时间由 log 框架另写，不改代码，留给你决策。
 fn chrono_now() -> String {
     use std::time::SystemTime;
     let now = SystemTime::now()
